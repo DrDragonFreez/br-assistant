@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.log
+
+# Env
+.env
+.env.local
+
+# Data (не коммитим тяжёлое)
+data/instructions/*.pdf
+data/synthetic_qa/*.jsonl
+chroma_db/
+qdrant_storage/
+
+# Models
+ml/output/
+*.gguf
+*.bin
+*.safetensors
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
