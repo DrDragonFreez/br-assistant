@@ -1,0 +1,72 @@
+# ─────────────────── WEB / API ───────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-multipart==0.0.12
+sse-starlette==2.1.3
+slowapi==0.1.9
+email-validator==2.2.0
+
+# ─────────────────── DB / MIGRATIONS ───────────────────
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+greenlet==3.1.1
+alembic==1.14.0
+
+# ─────────────────── CACHE / QUEUE ───────────────────
+redis[hiredis]==5.2.0
+celery[redis]==5.4.0
+
+# ─────────────────── VECTOR STORE ───────────────────
+qdrant-client==1.12.1
+
+# ─────────────────── HTTP / RETRY ───────────────────
+httpx==0.27.2
+tenacity==9.0.0
+aiofiles==24.1.0
+
+# ─────────────────── SECURITY ───────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1            # pin: passlib 1.7.4 несовместим с bcrypt>=4.1
+
+# ─────────────────── LLM / RAG / AGENTS ───────────────────
+# Пакеты langchain, langchain-community и langchain-text-splitters не нужны:
+# граф собран на langgraph, чанкер и ретривер свои, а единственная обёртка
+# LangChain (ChatOllama для RAGAS) живёт в langchain-ollama.
+langchain-core==0.3.21          # требуется langgraph и langchain-ollama
+langchain-ollama==0.2.0         # ChatOllama/OllamaEmbeddings для оценки RAGAS
+langgraph==0.2.53
+langgraph-checkpoint==2.0.6
+
+# ─────────────────── ПАРСИНГ ДОКУМЕНТОВ ───────────────────
+pypdf==5.1.0
+pdfplumber==0.11.4
+python-docx==1.1.2
+docxtpl==0.18.0
+beautifulsoup4==4.12.3
+lxml==5.3.0                     # парсер HTML и зависимость python-docx
+
+# ─────────────────── ОЦЕНКА КАЧЕСТВА (offline) ───────────────────
+# ВНИМАНИЕ: ragas тянет datasets/pandas/pyarrow (~400 МБ).
+# Если образ собирается дольше 5 мин — убери эти две строки,
+# они продублированы в requirements-eval.txt.
+ragas==0.2.6
+datasets==3.1.0
+
+# ─────────────────── OBSERVABILITY ───────────────────
+# Метрики уровня HTTP снимаются с логов Nginx, поэтому
+# prometheus-fastapi-instrumentator не нужен; доменные метрики RAG-контура
+# объявлены в app/core/metrics.py напрямую через prometheus-client.
+structlog==24.4.0
+prometheus-client==0.21.0
+
+# ─────────────────── UTILS ───────────────────
+python-dateutil==2.9.0.post0    # зависимость celery, пин для воспроизводимости
+
+# ─────────────────── TESTS ───────────────────
+pytest==8.3.4
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0

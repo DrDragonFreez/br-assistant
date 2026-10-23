@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "br-assistant-backend"
+version = "1.0.0"
+description = "Интеллектуальный помощник по внутренним регламентам Банка России"
+requires-python = ">=3.11,<3.13"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["alembic/versions", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "S", "D"]
+ignore = [
+    "D203",
+    "D213",
+    "S101",
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "S105", "S106"]
+"alembic/*" = ["D", "E501"]
+"app/db/models.py" = ["RUF012"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+exclude = ["alembic/versions/", "tests/"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: требует поднятых сервисов (postgres, qdrant, ollama)",
+    "slow: длительные тесты",
+]

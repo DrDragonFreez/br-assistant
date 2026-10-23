@@ -1,0 +1,25 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.git/
+.gitignore
+.idea/
+.vscode/
+# Каталог tests/ в образ попадает намеренно: тесты запускаются внутри
+# контейнера (make test), а своего окружения с зависимостями бэкенда
+# на хосте нет. Весят они килобайты.
+artifacts/
+*.log
+*.sqlite3
+.env
+.env.*
+!.env.example
+README.md
+docs/
