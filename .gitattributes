@@ -1,0 +1,25 @@
+# Переводы строк для файлов, которые исполняются или читаются внутри
+# контейнеров Linux.
+#
+# На машине разработки стоит core.autocrlf=true, поэтому без этих правил
+# shell-скрипты попадали бы в рабочее дерево с CRLF. Такой файл в контейнере
+# не запускается вовсе: ядро читает shebang вместе с символом \r и сообщает
+# "no such file or directory". По той же причине LF фиксируется для конфигов,
+# которые монтируются в образы, и для .env.example — лишний \r иначе
+# становится частью пароля.
+#
+# Правило "* text=auto" намеренно не задано: оно перенормализовало бы весь
+# репозиторий одним коммитом и скрыло бы содержательные правки.
+
+*.sh            text eol=lf
+*.conf          text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+Makefile        text eol=lf
+.env.example    text eol=lf
+
+*.png   binary
+*.jpg   binary
+*.pdf   binary
+*.docx  binary
+*.gguf  binary

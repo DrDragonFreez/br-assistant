@@ -97,6 +97,105 @@ def _normalize_value(value: Any) -> str:
     return str(value)
 
 
+def build_template_context(values: dict[str, Any]) -> dict[str, Any]:
+    """Готовит значения для подстановки в шаблон модуля.
+
+    Помимо самих полей добавляются производные значения, нужные разметке
+    бланка:
+
+    * ``<поле>_lines`` — список непустых строк многострочного значения;
+    * ``<поле>_rows`` — тот же список, разбитый по разделителю ``;`` на
+      ячейки. По нему строка таблицы модуля размножается циклом docxtpl:
+      примечание к бланку назначения ответственных прямо требует
+      «добавьте или удалите строки таблицы», а число назначаемых лиц
+      заранее неизвестно.
+
+    Args:
+        values: Значения полей, собранные у сотрудника.
+
+    Returns:
+        Контекст для :meth:`docxtpl.DocxTemplate.render`.
+    """
+    context: dict[str, Any] = {}
+
+    for key, value in values.items():
+        text = _normalize_value(value)
+        context[key] = text
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            continue
+        context[f"{key}_lines"] = lines
+        context[f"{key}_rows"] = [
+            [part.strip() for part in re.split(r"\s*[;|]\s*", line, maxsplit=1)] + [""]
+            for line in lines
+        ]
+
+    return context
+
+
+def finalize_rendered_document(document: Any) -> None:
+    """Доводит заполненный документ до вида, требуемого §3.3 рекомендаций.
+
+    После подстановки в документе остаются следы бланка: абзацы
+    необязательных пунктов, условие которых не выполнилось, становятся
+    пустыми, а нумерация распоряжающей части из-за этого теряет
+    непрерывность («1, 2, 4»). Рекомендации требуют удалить
+    неиспользованные варианты и проверить нумерацию пунктов — здесь это
+    делается автоматически, потому что иначе сотрудник обязан помнить
+    об этом сам.
+
+    Служебные зоны (дата, регистрационный номер, визуализация подписи)
+    не затрагиваются: они помечены «НЕ УДАЛЯТЬ» и обязаны сохраниться.
+
+    Args:
+        document: Документ python-docx после подстановки значений.
+    """
+    body_paragraphs = list(document.paragraphs)
+
+    # ── Пустые абзацы от невыполнившихся условий ──
+    for paragraph in body_paragraphs:
+        if paragraph.text.strip():
+            continue
+        # Пустые абзацы-разделители в бланке не содержат прогонов текста,
+        # а осиротевшие после подстановки — содержат.
+        if not paragraph.runs:
+            continue
+        node = paragraph._element
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+
+    # ── Непрерывная нумерация распоряжающей части ──
+    numbered = re.compile(r"^(\d{1,2})\.(\s+)(.*)$", re.DOTALL)
+    counter = 0
+    started = False
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if not started:
+            if text in {"ПРИКАЗЫВАЮ:", "ОБЯЗЫВАЮ:", "РАСПОРЯЖАЮСЬ:"}:
+                started = True
+            continue
+
+        match = numbered.match(text)
+        if not match:
+            continue
+
+        counter += 1
+        expected = str(counter)
+        if match.group(1) == expected:
+            continue
+
+        new_text = f"{expected}.{match.group(2)}{match.group(3)}"
+        if paragraph.runs:
+            paragraph.runs[0].text = new_text
+            for run in paragraph.runs[1:]:
+                run.text = ""
+
+    logger.info("document_finalized", renumbered_items=counter)
+
+
 class DocxGenerator:
     """Генератор черновиков документов."""
 
@@ -130,7 +229,11 @@ class DocxGenerator:
             from docxtpl import DocxTemplate
 
             document = DocxTemplate(str(template_path))
-            document.render({key: _normalize_value(value) for key, value in context.items()})
+            document.render(build_template_context(context))
+            # Доводка по §3.3 Методических рекомендаций выполняется после
+            # подстановки: пустые необязательные пункты исчезают, а
+            # нумерация распоряжающей части восстанавливается.
+            finalize_rendered_document(document.docx)
             document.save(str(output_path))
         except Exception as exc:  # noqa: BLE001
             raise DocumentParseError(

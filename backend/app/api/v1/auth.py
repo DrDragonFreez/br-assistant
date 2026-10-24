@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Request, status
 from sqlalchemy import select
 
-from app.api.v1.deps import CurrentUser, SessionDep, limiter, write_audit
+from app.api.v1.deps import CurrentUser, SessionDep, write_audit
 from app.api.v1.schemas import (
     CurrentUserResponse,
     LoginRequest,
@@ -48,7 +48,6 @@ MAX_FAILED_ATTEMPTS = 7
 
 
 @router.post("/login", response_model=TokenResponse, summary="Вход в систему")
-@limiter.limit(settings.RATE_LIMIT_LOGIN)
 async def login(
     request: Request,
     payload: LoginRequest,
@@ -116,7 +115,6 @@ async def login(
 
 
 @router.post("/refresh", response_model=TokenResponse, summary="Обновление токенов")
-@limiter.limit("20/minute")
 async def refresh(
     request: Request,
     payload: RefreshRequest,
@@ -170,6 +168,10 @@ async def refresh(
 @router.post(
     "/logout",
     status_code=status.HTTP_204_NO_CONTENT,
+    # Без явного response_model=None FastAPI принимает аннотацию
+    # возврата «-> None» за модель ответа и отказывается
+    # регистрировать маршрут: тело при 204 недопустимо.
+    response_model=None,
     summary="Выход из системы",
 )
 async def logout(request: Request, user: CurrentUser, session: SessionDep) -> None:
@@ -224,9 +226,12 @@ async def get_me(user: CurrentUser) -> CurrentUserResponse:
 @router.post(
     "/password",
     status_code=status.HTTP_204_NO_CONTENT,
+    # Без явного response_model=None FastAPI принимает аннотацию
+    # возврата «-> None» за модель ответа и отказывается
+    # регистрировать маршрут: тело при 204 недопустимо.
+    response_model=None,
     summary="Смена собственного пароля",
 )
-@limiter.limit("5/minute")
 async def change_password(
     request: Request,
     payload: PasswordChangeRequest,

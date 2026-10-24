@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from qdrant_client import AsyncQdrantClient, models
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.core.config import settings
 from app.core.exceptions import RetrievalError
@@ -79,6 +80,51 @@ async def collection_exists(name: str | None = None) -> bool:
         raise RetrievalError(context={"error": str(exc)}) from exc
 
 
+async def _create_collection(client: AsyncQdrantClient, collection: str) -> None:
+    """Создаёт коллекцию, допуская, что её уже создал соседний процесс.
+
+    Плотный вектор — bge-m3 с косинусной метрикой, разреженный — BM25
+    по собственному словарю; слияние выдач выполняет сам Qdrant.
+
+    Ответ 409 трактуется как успех: uvicorn запускает несколько рабочих
+    процессов, каждый проходит lifespan, и проверка существования
+    коллекции с её созданием не атомарна. Без этого второй процесс
+    падал на старте и сервис работал в половину рабочих процессов.
+
+    Args:
+        client: Асинхронный клиент Qdrant.
+        collection: Имя коллекции.
+
+    Raises:
+        UnexpectedResponse: Любая ошибка Qdrant, кроме конфликта имён.
+    """
+    try:
+        await client.create_collection(
+            collection_name=collection,
+            vectors_config={
+                DENSE_VECTOR_NAME: models.VectorParams(
+                    size=settings.VECTOR_SIZE,
+                    distance=models.Distance.COSINE,
+                    on_disk=False,
+                )
+            },
+            sparse_vectors_config={
+                SPARSE_VECTOR_NAME: models.SparseVectorParams(
+                    index=models.SparseIndexParams(on_disk=False)
+                )
+            },
+            optimizers_config=models.OptimizersConfigDiff(default_segment_number=2),
+            hnsw_config=models.HnswConfigDiff(m=16, ef_construct=128),
+        )
+    except UnexpectedResponse as exc:
+        if exc.status_code != 409:
+            raise
+        logger.info("qdrant_collection_created_by_peer", collection=collection)
+        return
+
+    logger.info("qdrant_collection_created", collection=collection)
+
+
 async def ensure_collection(name: str | None = None, *, recreate: bool = False) -> None:
     """Создаёт коллекцию с нужной схемой векторов и индексами payload.
 
@@ -102,24 +148,12 @@ async def ensure_collection(name: str | None = None, *, recreate: bool = False) 
             exists = False
 
         if not exists:
-            await client.create_collection(
-                collection_name=collection,
-                vectors_config={
-                    DENSE_VECTOR_NAME: models.VectorParams(
-                        size=settings.VECTOR_SIZE,
-                        distance=models.Distance.COSINE,
-                        on_disk=False,
-                    )
-                },
-                sparse_vectors_config={
-                    SPARSE_VECTOR_NAME: models.SparseVectorParams(
-                        index=models.SparseIndexParams(on_disk=False)
-                    )
-                },
-                optimizers_config=models.OptimizersConfigDiff(default_segment_number=2),
-                hnsw_config=models.HnswConfigDiff(m=16, ef_construct=128),
-            )
-            logger.info("qdrant_collection_created", collection=collection)
+            # Создание выполняется с оглядкой на соседние процессы:
+            # uvicorn поднимает несколько воркеров, и каждый проходит
+            # lifespan. Проверка «существует ли» и создание — не одна
+            # операция, поэтому второй воркер получал от Qdrant 409 и
+            # падал, не дойдя до приёма трафика.
+            await _create_collection(client, collection)
 
         payload_indexes: dict[str, models.PayloadSchemaType] = {
             "document_code": models.PayloadSchemaType.KEYWORD,

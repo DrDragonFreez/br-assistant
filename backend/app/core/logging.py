@@ -122,7 +122,10 @@ def configure_logging() -> None:
     shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
+        # structlog.stdlib.add_logger_name здесь неприменим: он читает
+        # у логгера поле name, которого у PrintLogger нет, и любой вызов
+        # лога падал бы с AttributeError. Имя модуля подставляет
+        # get_logger — см. ниже.
         structlog.processors.TimeStamper(fmt="iso", utc=False),
         structlog.processors.StackInfoRenderer(),
         add_request_context,
@@ -160,7 +163,13 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     Returns:
         Связанный логгер structlog.
     """
-    return structlog.get_logger(name)  # type: ignore[no-any-return]
+    # Имя модуля привязывается значением, а не процессором: фабрика
+    # PrintLogger не хранит имя, и structlog.stdlib.add_logger_name
+    # с ней несовместим.
+    logger = structlog.get_logger()
+    if name:
+        logger = logger.bind(logger=name)
+    return logger  # type: ignore[no-any-return]
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):

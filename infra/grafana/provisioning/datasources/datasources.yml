@@ -1,0 +1,21 @@
+# Описание источников данных.
+#
+# Как и дашборды, читается только из подкаталога
+# provisioning/datasources/.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # uid задан явно и совпадает со ссылками в dashboards/rag.json.
+    # Без него Grafana присвоит случайный, и панели дашборда не найдут
+    # источник данных — экран останется пустым.
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s
+      httpMethod: POST

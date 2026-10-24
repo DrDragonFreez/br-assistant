@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from app.agents.graph import run_assistant
-from app.agents.state import AnswerStatus
+from app.agents.state import AnswerStatus, Intent
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
 from app.core.rbac import Role, allowed_access_levels
@@ -84,6 +84,7 @@ class CaseResult:
     top_score: float
     latency_ms: int
     critic_verdict: str
+    intent: str = ""
 
     @property
     def citation_hit(self) -> bool:
@@ -101,14 +102,45 @@ class CaseResult:
         return matched / len(self.case.expected_clauses)
 
     @property
+    def declined(self) -> bool:
+        """True, если помощник отказался отвечать, а не выдумал ответ.
+
+        Отказ достигается двумя путями, и оба правильные. Генератор
+        возвращает ``no_context``, когда найденные фрагменты недостаточно
+        близки к вопросу. Маршрутизатор возвращает ``info`` с намерением
+        ``out_of_scope``, когда тема вообще вне базы знаний: оплата труда,
+        отпуска, закупки. Второй путь короче и надёжнее — модель к
+        формулировке ответа не привлекается вовсе.
+
+        Учитывать только ``no_context`` значило бы считать ошибкой
+        правильно отклонённый вопрос.
+        """
+        if self.answer_status == AnswerStatus.NO_CONTEXT.value:
+            return True
+        return (
+            self.answer_status == AnswerStatus.INFO.value
+            and self.intent == Intent.OUT_OF_SCOPE.value
+        )
+
+    @property
+    def fabricated(self) -> bool:
+        """True, если на вопрос вне базы знаний выдан содержательный ответ.
+
+        Это главный показатель достоверности: выдуманное требование,
+        срок или подразделение опаснее отсутствия ответа.
+        """
+        if not self.case.expect_no_answer:
+            return False
+        return self.answer_status == AnswerStatus.ANSWERED.value
+
+    @property
     def no_answer_correct(self) -> bool:
         """True, если поведение при отсутствии данных корректно.
 
         Проверяется в обе стороны: отказ там, где ответа быть не должно,
         и наличие ответа там, где он есть в базе знаний.
         """
-        declined = self.answer_status == AnswerStatus.NO_CONTEXT.value
-        return declined == self.case.expect_no_answer
+        return self.declined == self.case.expect_no_answer
 
 
 def load_eval_set(path: str | Path) -> list[EvalCase]:
@@ -182,6 +214,7 @@ async def run_case(case: EvalCase, *, user_role: str = Role.METHODOLOGIST.value)
         top_score=float(state.get("top_score", 0.0)),
         latency_ms=int(state.get("latency_ms", 0)),
         critic_verdict=state.get("critic_verdict", ""),
+        intent=state.get("intent", ""),
     )
 
 
@@ -198,6 +231,7 @@ def compute_custom_metrics(results: list[CaseResult]) -> dict[str, float]:
         return {}
 
     answered = [r for r in results if not r.case.expect_no_answer]
+    checked_by_critic = [r for r in results if r.critic_verdict]
     total = len(results)
 
     return {
@@ -209,12 +243,21 @@ def compute_custom_metrics(results: list[CaseResult]) -> dict[str, float]:
             1 for r in results if r.answer_status == AnswerStatus.ANSWERED.value
         )
         / total,
-        "no_answer_rate": sum(
-            1 for r in results if r.answer_status == AnswerStatus.NO_CONTEXT.value
+        "no_answer_rate": sum(1 for r in results if r.declined) / total,
+        # Ключевая метрика достоверности: ни одного выдуманного ответа
+        # на вопрос, которого нет в базе знаний.
+        "fabrication_rate": sum(1 for r in results if r.fabricated) / total,
+        "clarification_rate": sum(
+            1 for r in results if r.answer_status == AnswerStatus.CLARIFICATION.value
         )
         / total,
-        "critic_approval_rate": sum(1 for r in results if r.critic_verdict == "approved")
-        / total,
+        # Критик вызывается только после генерации ответа. На отказах и
+        # уточняющих вопросах вердикта нет, и считать их неодобренными
+        # неверно: это занижало долю втрое. Знаменатель — случаи,
+        # где критик действительно работал.
+        "critic_approval_rate": sum(1 for r in checked_by_critic if r.critic_verdict == "approved")
+        / max(len(checked_by_critic), 1),
+        "critic_checked_rate": len(checked_by_critic) / total,
         "avg_latency_ms": sum(r.latency_ms for r in results) / total,
         "avg_top_score": sum(r.top_score for r in answered) / max(len(answered), 1),
     }
@@ -353,6 +396,8 @@ async def run_evaluation(
                 "expected_clauses": r.case.expected_clauses,
                 "cited_clauses": r.cited_clauses,
                 "status": r.answer_status,
+                "intent": r.intent,
+                "top_score": round(r.top_score, 4),
             }
             for r in results
             if not r.citation_hit or not r.no_answer_correct
@@ -380,6 +425,8 @@ def format_report_table(report: dict[str, Any]) -> str:
         "citation_hit_rate": "Попадание в нужный пункт",
         "citation_precision": "Точность цитирования",
         "no_answer_accuracy": "Корректность отказов",
+        "fabrication_rate": "Выдуманных ответов",
+        "clarification_rate": "Задан уточняющий вопрос",
         "critic_approval_rate": "Одобрено критиком",
         "avg_latency_ms": "Средняя задержка, мс",
     }

@@ -16,10 +16,17 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from app.core.rbac import AccessLevel, Role
 
 
+# Поле «model_name» занято смыслом «какая языковая модель отвечала», а
+# pydantic резервирует префикс «model_» под свои атрибуты и предупреждает
+# о каждом совпадении. Переименовать поле нельзя: оно часть контракта API
+# и типов фронтенда, поэтому защита префикса снимается там, где он нужен.
+_ALLOW_MODEL_PREFIX = ConfigDict(protected_namespaces=())
+
+
 class ORMModel(BaseModel):
     """Базовая схема для моделей, читаемых из ORM."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, protected_namespaces=())
 
 
 # ═══════════════════════════ АУТЕНТИФИКАЦИЯ ═══════════════════════════
@@ -165,6 +172,8 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     """Ответ помощника."""
 
+    model_config = _ALLOW_MODEL_PREFIX
+
     message_id: uuid.UUID
     session_id: uuid.UUID
     answer: str
@@ -182,6 +191,13 @@ class ChatResponse(BaseModel):
     critic_verdict: str = ""
     model_name: str = ""
     latency_ms: int = 0
+    from_cache: bool = Field(
+        default=False,
+        description=(
+            "Ответ взят из кеша: поиск и модель не вызывались. "
+            "Задержку такого ответа нельзя сравнивать с полным контуром"
+        ),
+    )
     generated_document_id: uuid.UUID | None = None
     filled_fields: dict[str, Any] = Field(default_factory=dict)
     missing_fields: list[str] = Field(default_factory=list)

@@ -25,6 +25,51 @@ from app.rag.retriever import RetrievedChunk
 logger = get_logger(__name__)
 
 
+# Длина основы при лексическом сравнении. Морфологического анализатора в
+# контуре нет, и точное совпадение токенов на русском тексте почти не
+# работает: «регистрируется» и «регистрация», «исходящий» и «исходящего»
+# считались разными словами. Из-за этого фрагмент с ответом терял половину
+# своей оценки и выпадал из выдачи. Усечение до пяти символов снимает
+# большую часть падежей и видов глагола; возможные склейки вроде
+# «документ» и «документооборот» для признака пересечения допустимы.
+STEM_LENGTH = 5
+
+# Вес разнообразия в MMR. Разнообразие нужно: нормативный текст повторяет
+# формулировки, и без него выдача заполняется почти одинаковыми
+# фрагментами. Но перевешивать релевантность оно не должно, поэтому вес
+# заметно меньше единицы.
+MMR_DIVERSITY_WEIGHT = 0.3
+
+# Доля общих основ, при которой фрагмент считается повтором уже
+# отобранного. Такие фрагменты отсеиваются отдельным правилом, а не
+# весом разнообразия: повышать вес, чтобы вытеснить дубликат, значит
+# снова ставить разнообразие выше релевантности и терять фрагмент
+# с ответом. Если все оставшиеся кандидаты — повторы, берётся лучший
+# из них: выдача не должна оказаться короче запрошенной.
+NEAR_DUPLICATE_REDUNDANCY = 0.9
+
+
+def _stems(text: str) -> set[str]:
+    """Возвращает множество усечённых основ текста.
+
+    Номера пунктов не усекаются: «10.3» и «10.15» должны остаться
+    различимыми.
+
+    Args:
+        text: Исходный текст.
+
+    Returns:
+        Множество основ.
+    """
+    stems: set[str] = set()
+    for token in tokenize(text):
+        if token.replace(".", "").isdigit():
+            stems.add(token)
+        else:
+            stems.add(token[:STEM_LENGTH])
+    return stems
+
+
 class Reranker:
     """Cross-encoder реранкер поверх сервиса Infinity."""
 
@@ -115,33 +160,68 @@ class Reranker:
         Returns:
             Переранжированные фрагменты.
         """
-        query_tokens = set(tokenize(query))
-        if not query_tokens:
+        query_stems = _stems(query)
+        if not query_stems:
             return chunks[:top_n]
 
-        scored: list[tuple[float, RetrievedChunk]] = []
-        for chunk in chunks:
-            chunk_tokens = set(tokenize(chunk.content))
-            overlap = len(query_tokens & chunk_tokens) / len(query_tokens)
+        # Релевантность: оценка гибридного поиска уже учитывает и смысл
+        # (плотный вектор), и точные формулировки (BM25), поэтому вес у неё
+        # больший. Лексическое пересечение остаётся поправкой, а не
+        # половиной решения: иначе фрагмент, где нужное слово стоит в другой
+        # форме, проигрывает фрагменту, где оно просто упомянуто.
+        relevance: dict[int, float] = {}
+        stems_by_chunk: dict[int, set[str]] = {}
+        for index, chunk in enumerate(chunks):
+            chunk_stems = _stems(chunk.content)
+            stems_by_chunk[index] = chunk_stems
+            overlap = len(query_stems & chunk_stems) / len(query_stems)
             bonus = 0.15 if chunk.clause_number and chunk.clause_number in query else 0.0
-            scored.append((0.5 * chunk.score + 0.5 * overlap + bonus, chunk))
+            relevance[index] = 0.7 * chunk.score + 0.3 * overlap + bonus
 
-        scored.sort(key=lambda item: item[0], reverse=True)
-
+        # Maximal Marginal Relevance: на каждом шаге берётся кандидат с
+        # наибольшей разностью «релевантность минус схожесть с уже
+        # отобранными». Пересчёт после каждого выбора обязателен — без него
+        # отбор сводится к первым top_n по исходной оценке, а штраф за
+        # дублирование лишь переписывает им оценки, ни на что не влияя.
+        remaining = set(range(len(chunks)))
         selected: list[RetrievedChunk] = []
-        selected_tokens: set[str] = set()
-        for score, chunk in scored:
-            chunk_tokens = set(tokenize(chunk.content))
-            final_score = score
-            if selected_tokens:
-                redundancy = len(chunk_tokens & selected_tokens) / max(len(chunk_tokens), 1)
-                final_score *= 1.0 - 0.4 * redundancy
-            chunk.score = min(max(final_score, 0.0), 1.0)
+        selected_stems: set[str] = set()
+
+        while remaining and len(selected) < top_n:
+            best_index = -1
+            best_value = -math.inf
+            best_duplicate_index = -1
+            best_duplicate_value = -math.inf
+
+            for index in remaining:
+                value = relevance[index]
+                redundancy = 0.0
+                if selected_stems:
+                    chunk_stems = stems_by_chunk[index]
+                    redundancy = len(chunk_stems & selected_stems) / max(len(chunk_stems), 1)
+                    value -= MMR_DIVERSITY_WEIGHT * redundancy
+
+                if redundancy > NEAR_DUPLICATE_REDUNDANCY:
+                    if value > best_duplicate_value:
+                        best_duplicate_value = value
+                        best_duplicate_index = index
+                    continue
+
+                if value > best_value:
+                    best_value = value
+                    best_index = index
+
+            if best_index < 0:
+                # Остались только повторы — берём лучший из них.
+                best_index = best_duplicate_index
+                best_value = best_duplicate_value
+
+            remaining.discard(best_index)
+            chunk = chunks[best_index]
+            chunk.score = min(max(best_value, 0.0), 1.0)
             chunk.retrieval_source = f"{chunk.retrieval_source}+mmr"
             selected.append(chunk)
-            selected_tokens |= chunk_tokens
-            if len(selected) >= top_n:
-                break
+            selected_stems |= stems_by_chunk[best_index]
 
         selected.sort(key=lambda item: item.score, reverse=True)
         logger.info("rerank_fallback_used", selected=len(selected))

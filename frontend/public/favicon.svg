@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Помощник по регламентам">
+  <rect width="32" height="32" rx="6" fill="#1b3a7a"/>
+  <path d="M16 5l8 3v7.5c0 5-3.4 9.4-8 10.9-4.6-1.5-8-5.9-8-10.9V8l8-3z" fill="#fff" opacity=".95"/>
+  <path d="M12 15.5h8M12 12h8M12 19h5" stroke="#1b3a7a" stroke-width="1.6" stroke-linecap="round"/>
+</svg>

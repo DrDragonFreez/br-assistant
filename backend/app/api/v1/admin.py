@@ -231,7 +231,7 @@ async def upload_knowledge_file(
         )
 
     suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in settings.ALLOWED_UPLOAD_EXTENSIONS:
+    if suffix not in settings.allowed_upload_extensions:
         raise ValidationError(f"Формат «{suffix}» не поддерживается")
 
     target_dir = Path(settings.INSTRUCTIONS_DIR)
@@ -363,6 +363,10 @@ async def activate_document_version(
 @router.delete(
     "/knowledge/versions/{version_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    # Без явного response_model=None FastAPI принимает аннотацию
+    # возврата «-> None» за модель ответа и отказывается
+    # регистрировать маршрут: тело при 204 недопустимо.
+    response_model=None,
     summary="Удалить редакцию документа",
 )
 async def remove_version(

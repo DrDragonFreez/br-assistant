@@ -1,42 +1,54 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
+# Окружение
 .venv/
 venv/
 env/
+__pycache__/
+*.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .mypy_cache/
+.coverage
+htmlcov/
 
-# Node
-node_modules/
-.next/
-out/
-dist/
-*.log
-
-# Env
+# Секреты
 .env
 .env.local
-
-# Data (не коммитим тяжёлое)
-data/instructions/*.pdf
-data/synthetic_qa/*.jsonl
-chroma_db/
-qdrant_storage/
-
-# Models
-ml/output/
-*.gguf
-*.bin
-*.safetensors
+.env.*.local
+!.env.example
 
 # IDE
 .idea/
 .vscode/
 *.swp
-
-# OS
 .DS_Store
-Thumbs.db
+
+# Frontend
+node_modules/
+.next/
+out/
+build/
+next-env.d.ts
+*.tsbuildinfo
+
+# Данные и артефакты
+data/instructions/*
+data/templates/*
+data/synthetic_qa/*
+!data/**/.gitkeep
+artifacts/
+*.gguf
+*.safetensors
+outputs/
+lora_model/
+
+# Исходные материалы кейса от организаторов. Рабочие копии лежат
+# в data/instructions и data/templates, они тоже вне репозитория.
+# Видеозапись кейса — 285 МБ, в git ей не место.
+Новая папка/
+*.mp4
+*.mov
+
+# Логи
+*.log
+logs/

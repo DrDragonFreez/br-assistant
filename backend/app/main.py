@@ -17,15 +17,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from app.api.v1.health import router as health_router
 from app.api.v1.metrics import router as metrics_router
-from app.api.v1.deps import limiter
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.exceptions import register_exception_handlers
@@ -88,29 +83,6 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("application_stopped")
 
 
-async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    """Формирует ответ при превышении частоты запросов.
-
-    Args:
-        request: HTTP-запрос.
-        exc: Исключение ограничителя.
-
-    Returns:
-        Ответ со статусом 429.
-    """
-    request_id = getattr(request.state, "request_id", "")
-    logger.warning("rate_limit_exceeded", path=request.url.path, limit=str(exc.detail))
-    return JSONResponse(
-        status_code=429,
-        content={
-            "detail": "Слишком много запросов. Повторите через несколько секунд.",
-            "code": "rate_limit_exceeded",
-            "request_id": request_id,
-        },
-        headers={"Retry-After": "30"},
-    )
-
-
 def create_app() -> FastAPI:
     """Создаёт и настраивает приложение FastAPI.
 
@@ -133,15 +105,22 @@ def create_app() -> FastAPI:
         root_path=settings.API_ROOT_PATH,
     )
 
-    app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)  # type: ignore[arg-type]
 
-    app.add_middleware(SlowAPIMiddleware)
+    # Ограничение частоты запросов целиком вынесено в Nginx: зоны
+    # auth (5/мин), chat (20/мин), upload (10/мин) и общая api (60/мин).
+    #
+    # Библиотека slowapi из контура убрана. Её хранилище счётчиков —
+    # синхронный клиент Redis внутри async-обработчика, что запрещено
+    # правилами проекта. Кроме того, при недоступном Redis она отвечала
+    # отказом на каждый запрос, а её обёртка над обработчиком ломала
+    # разрешение аннотаций: FastAPI искал модели запроса в пространстве
+    # имён slowapi и приложение не поднималось вовсе. Фильтрация на
+    # границе контура надёжнее: она не зависит от состояния сервиса.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
+        allow_origins=settings.cors_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
@@ -149,11 +128,16 @@ def create_app() -> FastAPI:
         max_age=600,
     )
 
-    if settings.is_production:
-        app.add_middleware(
-            TrustedHostMiddleware,
-            allowed_hosts=["backend", "localhost", "127.0.0.1", "nginx", "*.local"],
-        )
+    # Фильтр заголовка Host настраивается, а по умолчанию выключен («*»).
+    #
+    # Жёсткий список имён в коде — ловушка для демонстрации: стоит открыть
+    # сервис по адресу машины в локальной сети (http://192.168.1.5/), и
+    # каждый запрос получает 400 «Invalid host header», хотя всё работает.
+    # Ограничивать Host уместно на прокси, где известны реальные имена
+    # контура; здесь список задаётся через TRUSTED_HOSTS, когда он нужен.
+    trusted_hosts = settings.trusted_hosts
+    if trusted_hosts != ["*"]:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
 
     app.add_middleware(RequestContextMiddleware)
 

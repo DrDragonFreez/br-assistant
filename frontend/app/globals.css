@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Палитра задана переменными CSS: tailwind.config.ts ссылается на них через
+ * hsl(var(--...)), поэтому менять оформление можно без пересборки конфига.
+ * Базовый оттенок — slate (см. components.json), акцент — сдержанный синий:
+ * интерфейс корпоративный, яркие цвета в нём неуместны.
+ */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 221 70% 34%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 210 40% 94%;
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 221 70% 34%;
+
+    --radius: 0.5rem;
+
+    /*
+     * Системный стек вместо внешнего шрифта: образ фронтенда собирается
+     * в контуре, где интернета может не быть, а next/font скачивает файлы
+     * во время сборки. Эти гарнитуры есть и в Windows, и в macOS, и в Linux.
+     */
+    --font-sans: 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, 'Liberation Sans', sans-serif;
+  }
+
+  .dark {
+    --background: 222 47% 9%;
+    --foreground: 210 40% 96%;
+
+    --card: 222 45% 12%;
+    --card-foreground: 210 40% 96%;
+
+    --popover: 222 45% 12%;
+    --popover-foreground: 210 40% 96%;
+
+    --primary: 213 85% 68%;
+    --primary-foreground: 222 47% 11%;
+
+    --secondary: 217 33% 18%;
+    --secondary-foreground: 210 40% 96%;
+
+    --muted: 217 33% 18%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 217 33% 22%;
+    --accent-foreground: 210 40% 96%;
+
+    --destructive: 0 63% 50%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 213 85% 68%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings:
+      'rlig' 1,
+      'calt' 1;
+  }
+
+  /* Нормативный текст читают долго — межстрочный интервал шире обычного. */
+  .prose-clause {
+    @apply text-sm leading-relaxed;
+  }
+}
+
+@layer components {
+  /*
+   * Ответ помощника. Разметка приходит из react-markdown, поэтому стили
+   * задаются по вложенным тегам, а не классами на элементах.
+   */
+  .answer-body {
+    @apply text-[15px] leading-relaxed;
+  }
+
+  .answer-body p + p {
+    @apply mt-3;
+  }
+
+  .answer-body ul {
+    @apply my-3 list-disc space-y-1 pl-5;
+  }
+
+  .answer-body ol {
+    @apply my-3 list-decimal space-y-1 pl-5;
+  }
+
+  .answer-body strong {
+    @apply font-semibold text-foreground;
+  }
+
+  .answer-body code {
+    @apply rounded bg-muted px-1 py-0.5 font-mono text-[13px];
+  }
+
+  .answer-body table {
+    @apply my-3 w-full border-collapse text-sm;
+  }
+
+  .answer-body th,
+  .answer-body td {
+    @apply border border-border px-2 py-1 text-left align-top;
+  }
+
+  /* Курсор печати: показывает, что поток ещё идёт. */
+  .streaming-caret::after {
+    content: '▋';
+    @apply ml-0.5 animate-pulse-dot text-primary;
+  }
+}
+
+/* Полоса прокрутки в списках диалогов и источников. */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 3px;
+  }
+}

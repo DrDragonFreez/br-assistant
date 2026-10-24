@@ -181,18 +181,6 @@ class KnowledgeBaseEmptyError(AppError):
     status_code = status.HTTP_409_CONFLICT
 
 
-class NoRelevantContextError(AppError):
-    """Релевантных положений инструкции не найдено.
-
-    Ключевое исключение анти-галлюцинационного контура: вместо выдумывания
-    ответа сервис честно сообщает об отсутствии данных.
-    """
-
-    message = "В базе знаний нет информации по этому вопросу"
-    code = "no_relevant_context"
-    status_code = status.HTTP_200_OK
-
-
 # ─────────────────────────── ОБРАБОТЧИКИ ───────────────────────────
 def _request_id(request: Request) -> str | None:
     """Достаёт сквозной идентификатор запроса, проставленный middleware."""

@@ -17,14 +17,11 @@ from typing import Annotated, Any
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.exceptions import AuthError, PermissionDeniedError, UserInactiveError
 from app.core.logging import get_logger
-from app.core.rbac import Permission, Role, allowed_access_levels, has_permission
+from app.core.rbac import Permission, allowed_access_levels, has_permission
 from app.core.security import decode_token
 from app.db.models import AuditLog, User
 from app.db.postgres import get_session
@@ -34,12 +31,8 @@ logger = get_logger(__name__)
 
 bearer_scheme = HTTPBearer(auto_error=False, description="JWT access-токен")
 
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=[settings.RATE_LIMIT_DEFAULT],
-    storage_uri=settings.REDIS_URL,
-    strategy="fixed-window",
-)
+# Ограничение частоты запросов вынесено в Nginx целиком — см. пояснение
+# в app.main. Здесь остаются только аутентификация, права и аудит.
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -124,38 +117,6 @@ def require(*permissions: Permission) -> Callable[[User], Awaitable[User]]:
             raise PermissionDeniedError(
                 "Недостаточно прав для выполнения операции",
                 context={"required": [item.value for item in missing]},
-            )
-        return user
-
-    return _check
-
-
-def require_role(*roles: Role) -> Callable[[User], Awaitable[User]]:
-    """Создаёт зависимость, ограничивающую доступ по роли.
-
-    Args:
-        *roles: Допустимые роли.
-
-    Returns:
-        Зависимость FastAPI.
-    """
-
-    async def _check(user: CurrentUser) -> User:
-        """Проверяет роль текущего пользователя.
-
-        Args:
-            user: Текущий пользователь.
-
-        Returns:
-            Тот же пользователь, если роль подходит.
-
-        Raises:
-            PermissionDeniedError: Роль не входит в список допустимых.
-        """
-        if user.role not in roles:
-            raise PermissionDeniedError(
-                "Операция доступна другой роли",
-                context={"allowed": [item.value for item in roles]},
             )
         return user
 

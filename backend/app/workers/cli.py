@@ -21,6 +21,7 @@ from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
 from app.db.models import DocumentVersion, KnowledgeDocument
 from app.db.postgres import close_postgres, lifespan_postgres, session_scope
+from app.db.redis import close_redis
 from app.db.qdrant_client import (
     close_qdrant,
     collection_stats,
@@ -369,6 +370,11 @@ async def _main_async(args: argparse.Namespace) -> int:
         handler = COMMANDS[args.command]
         return await handler(args)
     finally:
+        # Соединение с Redis закрывается явно: команды обслуживания сбрасывают
+        # кэш ответов, а оставленный пул освобождался бы сборщиком мусора уже
+        # после закрытия event loop — с трассировкой «Event loop is closed»
+        # в конце вполне успешного прогона.
+        await close_redis()
         await close_qdrant()
         await close_postgres()
 

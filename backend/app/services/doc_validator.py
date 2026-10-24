@@ -30,23 +30,39 @@ from app.rag.retriever import get_retriever
 logger = get_logger(__name__)
 
 # ─────────────────── Формальные правила ───────────────────
-REQUISITE_PATTERNS: dict[str, tuple[str, str]] = {
+# Проверяемые реквизиты: выражение для поиска, название и пункт Инструкции.
+#
+# Номер пункта обязателен. Замечание «не обнаружен обязательный реквизит»
+# без ссылки сотруднику нечем проверить, а выдумывать номер нельзя —
+# поэтому он взят из текста: перечень реквизитов установлен п. 8.2,
+# общее правило их применения — п. 8.1. Названия реквизитов приведены
+# к формулировкам самого перечня.
+REQUISITE_PATTERNS: dict[str, tuple[str, str, str]] = {
     "date": (
         r"\b\d{1,2}\s+(январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)"
         r"\w*\s+\d{4}|\b\d{2}\.\d{2}\.\d{4}\b",
         "дата документа",
+        "8.2",
     ),
-    "number": (r"№\s*[\d\-/]+|\bрег\w*\s*(номер|№)", "регистрационный номер"),
+    "number": (r"№\s*[\d\-/]+|\bрег\w*\s*(номер|№)", "регистрационный номер документа", "8.2"),
     "addressee": (
         r"\b(?:кому|адресат|начальник|руководител|директор|департамент|управлени)\w*",
         "адресат",
+        "8.2",
     ),
     "signature": (
         r"\b(подпись|_{3,}|И\.?О\.?\s*Фамили|\b[А-ЯЁ]\.\s?[А-ЯЁ]\.\s?[А-ЯЁ][а-яё]+)\b",
         "подпись",
+        "8.2",
     ),
-    "title": (r"\b(о|об)\s+[а-яё]{4,}", "заголовок к тексту"),
+    "title": (r"\b(о|об)\s+[а-яё]{4,}", "заголовок документа", "8.2"),
 }
+
+# Требование, на которое ссылаются замечания о реквизитах.
+REQUISITE_REQUIREMENT = (
+    "Реквизиты применяются сообразно виду документа независимо от носителя "
+    "[п. 8.1]; перечень реквизитов установлен [п. 8.2]."
+)
 
 STYLE_CHECKS: tuple[tuple[str, str, str], ...] = (
     (r"\s{3,}", "лишние пробелы", "minor"),
@@ -151,7 +167,7 @@ def check_formal_requisites(text: str) -> list[Violation]:
     """
     violations: list[Violation] = []
 
-    for key, (pattern, label) in REQUISITE_PATTERNS.items():
+    for key, (pattern, label, clause) in REQUISITE_PATTERNS.items():
         if re.search(pattern, text, re.IGNORECASE):
             continue
         severity = "critical" if key in {"date", "signature", "addressee"} else "major"
@@ -160,7 +176,9 @@ def check_formal_requisites(text: str) -> list[Violation]:
                 severity=severity,
                 field_name=label,
                 problem=f"В документе не обнаружен обязательный реквизит: {label}.",
-                recommendation=f"Добавьте {label} в соответствии с требованиями инструкции.",
+                requirement=REQUISITE_REQUIREMENT,
+                clause=clause,
+                recommendation=f"Добавьте реквизит «{label}» [п. {clause}].",
             )
         )
 

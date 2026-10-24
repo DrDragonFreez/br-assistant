@@ -1,0 +1,41 @@
+groups:
+  - name: rag_quality
+    rules:
+      - alert: BackendDown
+        expr: up{job="br-backend"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Backend недоступен"
+
+      - alert: HighNoAnswerRate
+        expr: >
+          rate(br_rag_no_answer_total[10m])
+          / clamp_min(rate(br_rag_queries_total[10m]), 0.001) > 0.4
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Более 40% запросов без ответа — проверить индекс базы знаний"
+
+      - alert: SlowLLMGeneration
+        expr: histogram_quantile(0.95, rate(br_llm_latency_seconds_bucket[5m])) > 45
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 генерации LLM превышает 45 секунд"
+
+      - alert: CriticRejectingAnswers
+        expr: >
+          rate(br_critic_verdicts_total{verdict="rejected"}[15m])
+          / clamp_min(sum(rate(br_critic_verdicts_total[15m])), 0.001) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Критик отклоняет более 20% ответов — проверить качество базы знаний"
+
+      - alert: KnowledgeBaseEmpty
+        expr: br_kb_chunks_indexed == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "База знаний пуста — выполните make index"

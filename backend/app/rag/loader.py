@@ -211,6 +211,76 @@ def _load_pdf_sync(path: Path) -> tuple[list[PageContent], dict[str, Any]]:
     return pages, meta
 
 
+def _table_row_blocks(table: Any, table_number: int) -> list[str]:
+    """Разбирает таблицу Word построчно.
+
+    Каждая содержательная строка становится отдельным блоком с шапкой
+    столбцов в формате ``столбец: значение``. Так строка матрицы
+    визирования остаётся цельной и читаемой без остальной таблицы:
+    «Приказы по вопросам информационных технологий — Юридическое
+    подразделение: Да; Департамент ДОУ: Да».
+
+    Строки-заголовки разделов (во всех ячейках один и тот же текст, как
+    «ВНУТРЕННИЕ ДОКУМЕНТЫ» в объединённой ячейке) становятся контекстом
+    для следующих строк, а не отдельными блоками: сами по себе они
+    бессмысленны.
+
+    Args:
+        table: Таблица python-docx.
+        table_number: Номер таблицы в документе, для адреса фрагмента.
+
+    Returns:
+        Список текстовых блоков — по одному на строку таблицы.
+    """
+    rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+    rows = [row for row in rows if any(row)]
+    if not rows:
+        return []
+
+    header = rows[0]
+    blocks: list[str] = []
+    section = ""
+
+    # Шапка целиком — отдельным блоком: по ней находится сама таблица.
+    blocks.append(
+        f"[Таблица {table_number}] Состав столбцов: " + " | ".join(item for item in header if item)
+    )
+
+    for row in rows[1:]:
+        values = [item for item in row if item]
+        # Объединённая ячейка во всю строку — это подзаголовок раздела.
+        if len(set(values)) == 1 and len(values) > 1:
+            section = values[0]
+            continue
+
+        subject = row[0]
+        if not subject:
+            continue
+
+        pairs: list[str] = []
+        seen: set[str] = set()
+        for column, value in zip(header[1:], row[1:], strict=False):
+            if not value or not column:
+                continue
+            # Объединённые ячейки повторяют значение — не дублируем его.
+            key = f"{column}:{value}"
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(f"{column}: {value}")
+
+        prefix = f"[Таблица {table_number}]"
+        if section:
+            prefix += f" {section}."
+
+        if pairs:
+            blocks.append(f"{prefix} {subject} — " + "; ".join(pairs))
+        else:
+            blocks.append(f"{prefix} {subject}")
+
+    return blocks
+
+
 def _load_docx_sync(path: Path) -> tuple[list[PageContent], dict[str, Any]]:
     """Извлекает текст из DOCX (синхронно).
 
@@ -258,14 +328,18 @@ def _load_docx_sync(path: Path) -> tuple[list[PageContent], dict[str, Any]]:
     if current:
         blocks.append("\n".join(current))
 
-    for table in document.tables:
-        rows = [
-            " | ".join(cell.text.strip() for cell in row.cells)
-            for row in table.rows
-            if any(cell.text.strip() for cell in row.cells)
-        ]
-        if rows:
-            blocks.append("[Таблица]\n" + "\n".join(rows))
+    # Таблицы разбираются построчно, а не одним блоком.
+    #
+    # Матрица обязательного визирования — это таблица, где строка = правило
+    # («приказы по вопросам информационных технологий визирует юридическое
+    # подразделение, Департамент ДОУ и Департамент ИБ»). Одним блоком она
+    # не помещается в фрагмент и режется посреди строк: ответ на вопрос
+    # «кто визирует приказ о приёме дел» получал бы обрывок таблицы вместо
+    # конкретного правила. Поэтому каждая строка становится отдельным
+    # логическим блоком, к которому приписана шапка столбцов — без неё
+    # значения «Да» и «Нет» нечитаемы.
+    for table_number, table in enumerate(document.tables, start=1):
+        blocks.extend(_table_row_blocks(table, table_number))
 
     pages = [
         PageContent(page_number=index, text=_normalize_whitespace(block))

@@ -153,3 +153,104 @@ def test_rules_always_report_their_source() -> None:
 
     assert result is not None
     assert result["source"] == "rules"
+
+
+class TestModuleQuestionsAreNotTemplateRequests:
+    """Вопрос о модуле — это вопрос, а не заказ бланка.
+
+    Слово «модуль» в Инструкции означает утверждённую структуру
+    документа. Пока оно стояло в шаблонах просьбы о бланке отдельным
+    словом, «что такое модуль документа» попадало в ветку выдачи бланка
+    и помощник переспрашивал тип документа вместо ответа со ссылкой
+    на пункт. Ветка про модули при этом была недостижима.
+    """
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Что такое модуль документа?",
+            "Где найти реестр модулей документов?",
+            "Какие требования к модулю приказа?",
+        ],
+    )
+    def test_module_question_is_classified_as_question(self, question: str) -> None:
+        """Вопрос о модулях получает намерение «вопрос» без уточнения."""
+        result = classify_by_rules(question)
+
+        assert result is not None
+        assert result["intent"] == Intent.QUESTION.value
+        assert result["needs_clarification"] is False
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Заполни модуль приказа",
+            "Подготовь документ по модулю",
+            "Сформируй проект по модулю распоряжения",
+        ],
+    )
+    def test_request_to_build_by_module_is_template_request(self, question: str) -> None:
+        """Просьба изготовить документ по модулю ведёт к подбору бланка."""
+        result = classify_by_rules(question)
+
+        assert result is not None
+        assert result["intent"] == Intent.TEMPLATE_REQUEST.value
+
+
+class TestQuestionAboutFormIsNotRequestForForm:
+    """Вопрос о требованиях к бланку — не заказ бланка.
+
+    Слова «бланк», «форма», «шаблон», «модуль» встречаются и в вопросе
+    о требованиях, и в просьбе выдать черновик, поэтому различается
+    формулировка, а не словарь. Пока различия не было, помощник на
+    вопрос «какие зоны должны быть предусмотрены в электронном бланке»
+    предлагал выбрать тип документа вместо ссылки на пункт.
+    """
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Какие зоны должны быть предусмотрены в электронном бланке документа?",
+            "Какие требования к бланку письма?",
+            "По какой форме составляется протокол?",
+            "Как оформляется приказ?",
+        ],
+    )
+    def test_question_about_requirements_goes_to_search(self, question: str) -> None:
+        """Вопрос о требованиях получает намерение «вопрос»."""
+        result = classify_by_rules(question)
+
+        assert result is not None
+        assert result["intent"] == Intent.QUESTION.value
+        assert result["needs_clarification"] is False
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Подготовь приказ о назначении ответственного",
+            "Составь служебную записку",
+            "Нужен бланк служебной записки",
+            "Заполни форму служебной записки",
+            "Покажи шаблон приказа",
+        ],
+    )
+    def test_request_to_produce_document_goes_to_templates(self, question: str) -> None:
+        """Побуждение изготовить документ ведёт к подбору бланка."""
+        result = classify_by_rules(question)
+
+        assert result is not None
+        assert result["intent"] == Intent.TEMPLATE_REQUEST.value
+
+    def test_reflexive_verb_is_not_a_request(self) -> None:
+        """Страдательная форма глагола не означает просьбы изготовить.
+
+        «Составляется», «оформляется», «создаётся» описывают порядок
+        работы; побуждение — «составь», «оформи», «создай».
+        """
+        descriptive = classify_by_rules("По какой форме составляется протокол?")
+        imperative = classify_by_rules("Составь протокол")
+
+        assert descriptive is not None
+        assert imperative is not None
+        assert descriptive["intent"] == Intent.QUESTION.value
+        assert imperative["intent"] == Intent.TEMPLATE_REQUEST.value

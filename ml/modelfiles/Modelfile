@@ -1,0 +1,39 @@
+# Modelfile для сборки дообученной модели в Ollama.
+# Сборка: ollama create br-assistant -f Modelfile  (или make models)
+#
+# ПОРЯДОК ДЕЙСТВИЙ:
+# 1. ml/synth_dataset.py — сгенерировать Q&A пары из чанков инструкции
+# 2. ml/train_lora.py    — дообучить QLoRA (Colab T4, ~90 мин)
+# 3. ml/export_gguf.py   — слить адаптер и выгрузить GGUF
+# 4. Положить полученный .gguf рядом с этим файлом и раскомментировать FROM ниже
+#
+# Пока GGUF не собран, оставьте строку FROM с базовой моделью: сервис
+# будет работать на ней, а generator автоматически переключится на
+# дообученную, как только она появится.
+
+FROM qwen2.5:7b-instruct
+# FROM ./br-assistant-q4_k_m.gguf
+
+# Температура близка к нулю: для нормативных текстов нужна
+# воспроизводимость, а не разнообразие формулировок.
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+PARAMETER repeat_penalty 1.05
+PARAMETER num_ctx 8192
+PARAMETER num_predict 1536
+
+# Стоп-последовательности: не дают модели продолжить за себя диалог.
+PARAMETER stop "ВОПРОС СОТРУДНИКА:"
+PARAMETER stop "ФРАГМЕНТЫ ИНСТРУКЦИИ:"
+PARAMETER stop "<|im_end|>"
+
+SYSTEM """Ты — помощник сотрудника Банка России по внутренним регламентам и документообороту. Отвечаешь только на основании переданных фрагментов инструкции, после каждого утверждения ставишь ссылку на пункт в квадратных скобках. Если во фрагментах нет ответа — возвращаешь строку НЕТ_В_БАЗЕ_ЗНАНИЙ и ничего не придумываешь."""
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>
+"""

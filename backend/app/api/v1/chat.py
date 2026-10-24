@@ -15,11 +15,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy import select
@@ -28,12 +29,11 @@ from sqlalchemy.orm import selectinload
 from sse_starlette.sse import EventSourceResponse
 
 from app.agents.graph import run_assistant
-from app.agents.state import AnswerStatus
+from app.agents.state import AnswerStatus, AssistantState
 from app.api.v1.deps import (
     AccessLevels,
     RequestId,
     SessionDep,
-    limiter,
     require,
     write_audit,
 )
@@ -59,7 +59,7 @@ from app.db.models import (
     User,
 )
 from app.db.postgres import session_scope
-from app.db.redis import slots_get
+from app.db.redis import cache_get, cache_set, slots_get
 from app.rag.generator import extract_citations, get_generator
 from app.rag.prompts import NO_ANSWER_MARKER, NO_ANSWER_MESSAGE, build_answer_prompt
 from app.rag.reranker import get_reranker
@@ -68,6 +68,56 @@ from app.rag.retriever import get_retriever
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["Диалог"])
+
+
+def _answer_cache_key(question: str, access_levels: list[str]) -> str:
+    """Строит ключ кеша ответа.
+
+    В ключ обязательно входят доступные роли грифы: один и тот же вопрос
+    от сотрудника и от методолога опирается на разный состав положений,
+    и общий ключ раздал бы сотруднику ответ с закрытыми для него
+    требованиями. Имя активной модели тоже учитывается — иначе сравнение
+    базовой и дообученной модели читало бы ответы друг друга.
+
+    Args:
+        question: Текст обращения.
+        access_levels: Грифы, доступные роли пользователя.
+
+    Returns:
+        Ключ кеша (без префикса пространства имён).
+    """
+    normalized = " ".join(question.lower().split())
+    material = "|".join(
+        [normalized, ",".join(sorted(access_levels)), settings.OLLAMA_MODEL_ACTIVE]
+    )
+    return f"answer:{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
+
+
+def _cacheable_state(state: AssistantState) -> dict[str, Any]:
+    """Отбирает из состояния графа то, что имеет смысл кешировать.
+
+    Фрагменты поиска и трасса узлов в кеш не кладутся: они весят больше
+    самого ответа и при повторном обращении не нужны.
+
+    Args:
+        state: Итоговое состояние графа.
+
+    Returns:
+        Сериализуемый в JSON срез состояния.
+    """
+    keys = (
+        "answer",
+        "answer_status",
+        "citations",
+        "intent",
+        "top_score",
+        "critic_verdict",
+        "model_name",
+        "latency_ms",
+        "prompt_tokens",
+        "completion_tokens",
+    )
+    return {key: state.get(key) for key in keys if state.get(key) is not None}
 
 
 async def _get_session_or_404(
@@ -200,7 +250,6 @@ async def _persist_citations(
 
 
 @router.post("", response_model=ChatResponse, summary="Задать вопрос помощнику")
-@limiter.limit(settings.RATE_LIMIT_CHAT)
 async def ask(
     request: Request,
     payload: ChatRequest,
@@ -238,17 +287,42 @@ async def ask(
 
     stored_slots = await slots_get(str(chat_session.id))
 
-    state = await run_assistant(
-        question=payload.message,
-        session_id=str(chat_session.id),
-        user_id=str(user.id),
-        user_role=user.role.value,
-        allowed_levels=access_levels,
-        history=history,
-        request_id=request_id,
-        filled_fields=stored_slots,
-        template_code=payload.template_code,
+    # Кеш отвечает только на самостоятельные вопросы: заполнение бланка,
+    # уточнения и ответы с опорой на историю диалога зависят от состояния,
+    # и переиспользовать их нельзя.
+    cache_key = (
+        _answer_cache_key(payload.message, access_levels)
+        if not payload.template_code and not stored_slots and not history
+        else ""
     )
+    state: AssistantState | None = None
+    from_cache = False
+
+    if cache_key:
+        cached = await cache_get(cache_key)
+        if cached:
+            state = cast(AssistantState, cached)
+            from_cache = True
+            logger.info("answer_served_from_cache", role=user.role.value)
+
+    if state is None:
+        state = await run_assistant(
+            question=payload.message,
+            session_id=str(chat_session.id),
+            user_id=str(user.id),
+            user_role=user.role.value,
+            allowed_levels=access_levels,
+            history=history,
+            request_id=request_id,
+            filled_fields=stored_slots,
+            template_code=payload.template_code,
+        )
+
+        # В кеш попадают только состоявшиеся ответы: отказы, уточнения
+        # и ошибки дешевле пересчитать, чем объяснять, почему помощник
+        # повторяет отказ после загрузки новой редакции инструкции.
+        if cache_key and state.get("answer_status") == AnswerStatus.ANSWERED.value:
+            await cache_set(cache_key, _cacheable_state(state))
 
     assistant_message = ChatMessage(
         session_id=chat_session.id,
@@ -267,6 +341,10 @@ async def ask(
             "node_trace": state.get("node_trace", []),
             "used_fallback": state.get("used_fallback", False),
             "template_code": state.get("template_code", ""),
+            # Признак нужен при разборе метрик: ответ из кеша не проходил
+            # ни поиск, ни модель, и его задержку нельзя смешивать
+            # с задержкой полного контура.
+            "from_cache": from_cache,
         },
     )
     await _persist_citations(db, assistant_message, state.get("citations", []))
@@ -305,13 +383,13 @@ async def ask(
         critic_verdict=state.get("critic_verdict", ""),
         model_name=state.get("model_name", ""),
         latency_ms=int(state.get("latency_ms", 0)),
+        from_cache=from_cache,
         filled_fields=state.get("filled_fields", {}),
         missing_fields=state.get("missing_fields", []),
     )
 
 
 @router.post("/stream", summary="Задать вопрос с потоковой выдачей ответа")
-@limiter.limit(settings.RATE_LIMIT_CHAT)
 async def ask_stream(
     request: Request,
     payload: ChatRequest,
@@ -545,6 +623,10 @@ async def get_session_detail(
 @router.delete(
     "/sessions/{session_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    # Без явного response_model=None FastAPI принимает аннотацию
+    # возврата «-> None» за модель ответа и отказывается
+    # регистрировать маршрут: тело при 204 недопустимо.
+    response_model=None,
     summary="Удалить диалог",
 )
 async def delete_session(
@@ -582,6 +664,10 @@ async def delete_session(
 @router.post(
     "/messages/{message_id}/feedback",
     status_code=status.HTTP_204_NO_CONTENT,
+    # Без явного response_model=None FastAPI принимает аннотацию
+    # возврата «-> None» за модель ответа и отказывается
+    # регистрировать маршрут: тело при 204 недопустимо.
+    response_model=None,
     summary="Оценить ответ помощника",
 )
 async def submit_feedback(

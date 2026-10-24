@@ -92,15 +92,33 @@ async def collect_components() -> list[ComponentHealth]:
         )
     )
 
-    reranker_ok = await get_reranker().health()
+    # Реранкер, выключенный настройкой, готовности не нарушает.
+    #
+    # RERANKER_ENABLED=false — поддерживаемый режим работы: граф переходит
+    # на MMR-переранжирование и отвечает со ссылками на пункты как обычно.
+    # Пока этот режим давал «degraded», контур в штатной конфигурации
+    # всегда числился неисправным: такую пробу перестают читать, а
+    # оркестратор по ней не выпустит новую версию в работу. Качество
+    # поиска без реранкера ниже, и это видно в отчёте об оценке, но к
+    # готовности сервиса отношения не имеет.
+    if not settings.RERANKER_ENABLED:
+        reranker_ok = True
+        reranker_details = {
+            "enabled": False,
+            "mode": "отключён настройкой, переранжирование выполняет MMR",
+        }
+    else:
+        reranker_ok = await get_reranker().health()
+        reranker_details = {
+            "enabled": True,
+            "fallback": "mmr" if not reranker_ok else "",
+        }
+
     components.append(
         ComponentHealth(
             name="reranker",
             healthy=reranker_ok,
-            details={
-                "enabled": settings.RERANKER_ENABLED,
-                "fallback": "mmr" if not reranker_ok else "",
-            },
+            details=reranker_details,
         )
     )
 

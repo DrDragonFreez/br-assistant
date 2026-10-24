@@ -9,10 +9,49 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
+import email_validator
 from pydantic import Field, SecretStr, computed_field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Внутренние зоны корпоративной сети разрешены в адресах электронной почты.
+#
+# Библиотека email-validator считает «local» и «localhost» зарезервированными
+# и отклоняет адреса вида admin@cbr.local. Для публичного сервиса это верно,
+# но помощник разворачивается в закрытом контуре, где домен каталога учётных
+# записей как раз такой и публичного DNS нет вовсе. Без этой правки
+# ни одна учётная запись контура не проходит проверку схемы: вход отдаёт
+# 422, а администратор не может создать пользователя.
+#
+# Остальные особые зоны (arpa, invalid, onion, test) по-прежнему отклоняются.
+# Список меняется до первой проверки адреса: модуль настроек импортируют
+# и API, и Celery, и CLI, поэтому правило действует во всех процессах.
+INTERNAL_EMAIL_DOMAIN_ZONES = ("local", "localhost")
+for _zone in INTERNAL_EMAIL_DOMAIN_ZONES:
+    if _zone in email_validator.SPECIAL_USE_DOMAIN_NAMES:
+        email_validator.SPECIAL_USE_DOMAIN_NAMES.remove(_zone)
+
+
+def _split_list(raw: str) -> list[str]:
+    """Разбирает перечень, заданный строкой.
+
+    Принимается и запись через запятую («a,b»), и JSON-массив
+    («["a","b"]»): в ``.env`` удобнее первое, в переменных окружения
+    оркестратора встречается второе.
+
+    Args:
+        raw: Значение из конфигурации.
+
+    Returns:
+        Список непустых элементов без крайних пробелов и кавычек.
+    """
+    text = raw.strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return [item.strip().strip("\"'") for item in text.split(",") if item.strip().strip("\"'")]
 
 
 class Settings(BaseSettings):
@@ -51,10 +90,21 @@ class Settings(BaseSettings):
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     JWT_ISSUER: str = "br-assistant"
     PASSWORD_MIN_LENGTH: int = 10
-    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost"])
-    RATE_LIMIT_DEFAULT: str = "60/minute"
-    RATE_LIMIT_CHAT: str = "20/minute"
-    RATE_LIMIT_LOGIN: str = "5/minute"
+    # Перечни читаются строкой, а не списком, осознанно: pydantic-settings
+    # разбирает поля-коллекции как JSON в самом источнике — до валидаторов
+    # модели. Значение «http://localhost,http://localhost:3000» из .env
+    # до валидатора не доходило и роняло сервис на старте с ошибкой
+    # «error parsing value for field CORS_ORIGINS». Разбор выполняют
+    # свойства cors_origins и allowed_upload_extensions ниже.
+    CORS_ORIGINS: str = "http://localhost"
+    # Допустимые значения заголовка Host. По умолчанию «*» — проверка
+    # выключена: ограничивать Host должен обратный прокси, которому
+    # известны реальные имена контура. Жёсткий список здесь приводил
+    # к ответу 400 при обращении по IP-адресу машины.
+    TRUSTED_HOSTS: str = "*"
+    # Ограничение частоты запросов задаётся зонами Nginx
+    # (infra/nginx/nginx.conf) и в приложении не дублируется:
+    # два источника правды для одного предела расходятся молча.
     BOOTSTRAP_ADMIN_EMAIL: str = "admin@cbr.local"
     BOOTSTRAP_ADMIN_PASSWORD: SecretStr = SecretStr("change_me")
     PII_REDACTION_ENABLED: bool = True
@@ -134,24 +184,12 @@ class Settings(BaseSettings):
     PDF_DROP_WATERMARK: bool = True
     PDF_WATERMARK_MIN_LIGHTNESS: float = 0.3
     MAX_UPLOAD_SIZE_MB: int = 50
-    ALLOWED_UPLOAD_EXTENSIONS: list[str] = Field(
-        default_factory=lambda: [".pdf", ".docx", ".txt", ".md", ".html"]
-    )
+    ALLOWED_UPLOAD_EXTENSIONS: str = ".pdf,.docx,.txt,.md,.html"
 
     # ─────────────────────────────── OBSERVABILITY ───────────────────────────────
     METRICS_ENABLED: bool = True
 
     # ─────────────────────────── ВАЛИДАТОРЫ ───────────────────────────
-    @field_validator("CORS_ORIGINS", "ALLOWED_UPLOAD_EXTENSIONS", mode="before")
-    @classmethod
-    def _split_csv(cls, value: Any) -> Any:
-        """Разрешает задавать списки строкой через запятую в .env."""
-        if isinstance(value, str):
-            if value.strip().startswith("["):
-                return value
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
-
     @field_validator("SECRET_KEY")
     @classmethod
     def _validate_secret(cls, value: SecretStr) -> SecretStr:
@@ -203,6 +241,36 @@ class Settings(BaseSettings):
         return self
 
     # ─────────────────────────── ВЫЧИСЛЯЕМЫЕ ───────────────────────────
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def cors_origins(self) -> list[str]:
+        """Источники, которым разрешены запросы к API.
+
+        Returns:
+            Список адресов; пустой список означает запрет всех источников.
+        """
+        return _split_list(self.CORS_ORIGINS)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def trusted_hosts(self) -> list[str]:
+        """Имена, с которыми сервис принимает запросы.
+
+        Returns:
+            Список имён; ``["*"]`` означает, что проверка Host не ведётся.
+        """
+        return _split_list(self.TRUSTED_HOSTS) or ["*"]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def allowed_upload_extensions(self) -> list[str]:
+        """Расширения файлов, которые принимает загрузчик.
+
+        Returns:
+            Список расширений в нижнем регистре, с ведущей точкой.
+        """
+        return [item.lower() for item in _split_list(self.ALLOWED_UPLOAD_EXTENSIONS)]
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def max_upload_size_bytes(self) -> int:

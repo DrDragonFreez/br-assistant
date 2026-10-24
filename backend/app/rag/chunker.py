@@ -350,7 +350,9 @@ class ClauseAwareChunker:
                 content = f"{prefix}{part}".strip()
 
                 extra: dict[str, Any] = {
-                    "has_table": "[Таблица]" in part,
+                    # Метка ставится и как «[Таблица]» (PDF), и как
+                    # «[Таблица 1]» (DOCX, построчный разбор).
+                    "has_table": "[Таблица" in part,
                     "has_deadline": bool(
                         re.search(r"\b(срок|в течение|не позднее|рабочи[хе] дн)", part, re.I)
                     ),

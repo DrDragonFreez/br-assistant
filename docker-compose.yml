@@ -1,2 +1,402 @@
+name: br-hackathon
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  image: br-hackathon/backend:latest
+  env_file: [.env]
+  restart: unless-stopped
+  logging: *default-logging
+  volumes:
+    - ./data:/app/data
+    - backend_artifacts:/app/artifacts
+    # Служебные скрипты в образ не копируются — сервису в работе они не
+    # нужны и тянули бы в него лишнее. Но запустить их больше негде:
+    # зависимости бэкенда по правилам проекта в локальный .venv не
+    # ставятся, а сборке шаблонов нужны docxtpl и python-docx.
+    # Монтирование только для чтения даёт запуск
+    # `docker compose exec backend python scripts/build_templates.py`
+    # без раздувания образа.
+    - ./ml:/app/ml:ro
+    - ./scripts:/app/scripts:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    qdrant:
+      condition: service_healthy
+    ollama:
+      condition: service_healthy
+
 services:
-  
+  # ─────────────────────────── ДАННЫЕ (internal-сеть) ───────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: br_postgres
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [br_net]
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    container_name: br_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [br_net]
+    logging: *default-logging
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: br_qdrant
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      QDRANT__SERVICE__ENABLE_TLS: "false"
+      QDRANT__TELEMETRY_DISABLED: "true"
+      QDRANT__LOG_LEVEL: INFO
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [br_net]
+    logging: *default-logging
+
+  # ─────────────────────────── LLM / EMBEDDINGS / RERANK ───────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: br_ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-2}
+      OLLAMA_FLASH_ATTENTION: "1"
+    volumes:
+      - ollama_models:/root/.ollama
+      - ./ml/modelfiles:/modelfiles:ro
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    networks: [br_net, br_edge]   # br_edge нужен для `ollama pull` из интернета
+    logging: *default-logging
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Одноразовый сервис: тянет модели и собирает LoRA-модель из Modelfile.
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: br_ollama_init
+    restart: "no"
+    env_file: [.env]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "set -e;
+       echo '>> pulling LLM: ${OLLAMA_LLM_MODEL}';
+       ollama pull ${OLLAMA_LLM_MODEL};
+       echo '>> pulling embeddings: ${OLLAMA_EMBED_MODEL}';
+       ollama pull ${OLLAMA_EMBED_MODEL};
+       if [ -f /modelfiles/Modelfile ]; then
+         echo '>> building fine-tuned model: ${OLLAMA_FT_MODEL}';
+         ollama create ${OLLAMA_FT_MODEL} -f /modelfiles/Modelfile || echo 'WARN: LoRA build skipped';
+       fi;
+       echo '>> ollama-init done'"
+    volumes:
+      - ./ml/modelfiles:/modelfiles:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks: [br_net]
+    logging: *default-logging
+
+  # Реранкер bge-reranker-v2-m3: Ollama не умеет rerank-эндпоинт, поднимаем Infinity.
+  reranker:
+    image: michaelf34/infinity:0.0.76
+    container_name: br_reranker
+    restart: unless-stopped
+    # Сервис объявлен, но при обычном `up` не поднимается.
+    #
+    # Ограничение — видеопамять. qwen2.5-7b при окне 8192 занимает около
+    # 5,5 ГБ, bge-m3 — ещё около 0,7 ГБ; на карте с 8 ГБ это почти весь
+    # объём, и bge-reranker-v2-m3 (около 2,5 ГБ) туда не помещается.
+    # Infinity поднимется, но будет падать при загрузке весов.
+    #
+    # Профиль связывает запуск сервиса с настройкой RERANKER_ENABLED:
+    # при RERANKER_ENABLED=false граф сам переходит на MMR, и держать
+    # неиспользуемый сервис запущенным незачем. Запуск с реранкером —
+    # `make up-rerank` либо `docker compose --profile reranker up -d`;
+    # нужна карта от 12 ГБ.
+    profiles: ["reranker"]
+    environment:
+      INFINITY_MODEL_ID: ${RERANKER_MODEL}
+      INFINITY_ENGINE: torch
+      INFINITY_PORT: "7997"
+      INFINITY_BATCH_SIZE: "16"
+      HF_HOME: /app/.cache/huggingface
+    command: ["v2", "--model-id", "${RERANKER_MODEL}", "--port", "7997", "--engine", "torch"]
+    volumes:
+      - hf_cache:/app/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:7997/health')\" || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    networks: [br_net, br_edge]   # br_edge — скачать веса с HuggingFace при первом старте
+    logging: *default-logging
+
+  # ─────────────────────────── ПРИЛОЖЕНИЕ ───────────────────────────
+  backend:
+    <<: *backend-base
+    container_name: br_backend
+    environment:
+      # Миграции применяет только этот сервис, и только он.
+      #
+      # Поддержка в docker-entrypoint.sh была, но переменную никто не
+      # задавал: таблицы в базе не создавались, и первый же `make seed`
+      # падал на отсутствующих отношениях. Celery-воркер и планировщик
+      # флаг не получают намеренно — три контейнера, одновременно
+      # выполняющие `alembic upgrade head`, борются за одну таблицу
+      # версий. Контейнер здесь один, несмотря на UVICORN_WORKERS:
+      # entrypoint выполняется до запуска рабочих процессов.
+      RUN_MIGRATIONS: "1"
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*' --workers ${UVICORN_WORKERS:-2}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks: [br_net, br_edge]
+
+  celery-worker:
+    <<: *backend-base
+    container_name: br_celery_worker
+    command: >
+      celery -A app.workers.celery_app:celery_app worker
+      --loglevel=${LOG_LEVEL:-info}
+      --concurrency=${CELERY_CONCURRENCY:-2}
+      -Q indexing,documents,eval,default
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 45s
+    networks: [br_net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  celery-beat:
+    <<: *backend-base
+    container_name: br_celery_beat
+    command: >
+      celery -A app.workers.celery_app:celery_app beat
+      --loglevel=${LOG_LEVEL:-info}
+      --schedule=/app/artifacts/celerybeat-schedule
+    # Своя проверка обязательна: из образа бэкенда наследуется опрос
+    # HTTP-эндпоинта /health, которого у планировщика нет — он не
+    # поднимает веб-сервер. Контейнер при этом работал исправно, но
+    # числился «unhealthy» всё время работы.
+    #
+    # Планировщик при каждом проходе цикла сбрасывает расписание на диск,
+    # поэтому признак живости — свежесть этого файла. Запас взят с
+    # четырёхкратным превышением интервала синхронизации.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os,sys,time;
+          p='/app/artifacts/celerybeat-schedule';
+          sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 720 else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks: [br_net]
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    image: br-hackathon/frontend:latest
+    container_name: br_frontend
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks: [br_edge]
+    logging: *default-logging
+
+  # ─────────────────────────── EDGE / НАБЛЮДАЕМОСТЬ ───────────────────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: br_nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/proxy_common.conf:/etc/nginx/proxy_common.conf:ro
+      - nginx_cache:/var/cache/nginx
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/healthz || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks: [br_edge]
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: br_prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks: [br_net, br_edge]
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: br_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "%(protocol)s://%(domain)s/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks: [br_edge]
+    logging: *default-logging
+
+networks:
+  # Внутренний контур: БД, кеш, векторка. Наружу не публикуется ни один порт.
+  br_net:
+    name: br_net
+    driver: bridge
+    internal: true
+  # Edge-контур: только то, что обязано ходить в интернет / принимать трафик Nginx.
+  br_edge:
+    name: br_edge
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  qdrant_snapshots:
+  ollama_models:
+  hf_cache:
+  backend_artifacts:
+  prometheus_data:
+  grafana_data:
+  nginx_cache:

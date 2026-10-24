@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 
-from app.api.v1.deps import AccessLevels, SessionDep, limiter, require, write_audit
+from app.api.v1.deps import AccessLevels, SessionDep, require, write_audit
 from app.api.v1.schemas import (
     DocumentGenerateRequest,
     GeneratedDocumentResponse,
@@ -67,10 +67,10 @@ async def _save_upload(upload: UploadFile) -> Path:
     original_name = upload.filename or "upload"
     suffix = Path(original_name).suffix.lower()
 
-    if suffix not in settings.ALLOWED_UPLOAD_EXTENSIONS:
+    if suffix not in settings.allowed_upload_extensions:
         raise UnsupportedFileTypeError(
             f"Формат «{suffix or 'без расширения'}» не поддерживается. "
-            f"Доступные: {', '.join(settings.ALLOWED_UPLOAD_EXTENSIONS)}"
+            f"Доступные: {', '.join(settings.allowed_upload_extensions)}"
         )
 
     upload_dir = Path(settings.ARTIFACTS_DIR) / "uploads"
@@ -151,7 +151,6 @@ async def get_template(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Сформировать черновик документа",
 )
-@limiter.limit("20/minute")
 async def create_document(
     request: Request,
     payload: DocumentGenerateRequest,
@@ -375,7 +374,6 @@ async def download_generated(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Проверить проект документа",
 )
-@limiter.limit("10/minute")
 async def validate_draft(
     request: Request,
     db: SessionDep,

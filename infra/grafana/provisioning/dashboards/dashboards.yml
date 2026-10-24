@@ -1,0 +1,20 @@
+# Описание источника дашбордов.
+#
+# Файл обязан лежать в подкаталоге provisioning/dashboards/: файлы прямо
+# в provisioning/ Grafana не читает вовсе. Пока он лежал уровнем выше,
+# дашборд не загружался и список панелей был пуст — при полностью
+# исправном содержимом.
+
+apiVersion: 1
+
+providers:
+  - name: br-assistant
+    orgId: 1
+    folder: "Помощник по регламентам"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

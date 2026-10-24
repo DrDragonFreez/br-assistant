@@ -1,0 +1,56 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: br-hackathon
+    env: local
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Главная цель: метрики FastAPI (включая доменные метрики RAG-контура)
+  - job_name: br-backend
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["backend:8000"]
+        labels:
+          service: backend
+          component: api
+
+  # Qdrant и Ollama отдельными целями не опрашиваются:
+  #
+  # * Qdrant отдаёт /metrics только с заголовком api-key (он задан через
+  #   QDRANT__SERVICE__API_KEY), а Prometheus читает ключ лишь из файла —
+  #   пришлось бы монтировать секрет в контейнер ради пары счётчиков.
+  #   Объём базы знаний и так виден в br_kb_chunks_indexed.
+  # * У Ollama эндпоинта метрик нет вовсе; состояние модели видно по
+  #   br_llm_latency_seconds, br_llm_errors_total и br_llm_fallback_total.
+  #
+  # Постоянно красные цели на дашборде хуже их отсутствия: они маскируют
+  # настоящие сбои.
+
+  # Цель реранкера по умолчанию отключена по тому же правилу.
+  #
+  # Сервис объявлен за профилем Compose и при обычном `up` не поднимается:
+  # bge-reranker-v2-m3 не помещается в видеопамять рядом с qwen2.5-7b.
+  # Включённая цель при выключенном сервисе даёт постоянный up=0 —
+  # ровно ту красноту, которая обесценивает дашборд.
+  #
+  # Запускаете контур с реранкером (`make up-rerank`) — снимите
+  # комментарий ниже и перечитайте конфигурацию:
+  # `docker compose kill -s SIGHUP prometheus`.
+  #
+  # - job_name: br-reranker
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ["reranker:7997"]
+  #       labels:
+  #         service: reranker
+  #         component: rerank

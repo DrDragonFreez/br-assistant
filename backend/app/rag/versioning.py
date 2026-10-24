@@ -50,26 +50,6 @@ async def get_document_by_code(session: AsyncSession, code: str) -> KnowledgeDoc
     return document
 
 
-async def get_active_version(
-    session: AsyncSession, document_id: uuid.UUID
-) -> DocumentVersion | None:
-    """Возвращает действующую редакцию документа.
-
-    Args:
-        session: Сессия БД.
-        document_id: Идентификатор документа.
-
-    Returns:
-        Активная версия или None, если ни одна не активирована.
-    """
-    return await session.scalar(
-        select(DocumentVersion).where(
-            DocumentVersion.document_id == document_id,
-            DocumentVersion.is_active.is_(True),
-        )
-    )
-
-
 async def find_version_by_hash(
     session: AsyncSession, document_id: uuid.UUID, content_hash: str
 ) -> DocumentVersion | None:
