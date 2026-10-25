@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import pytest
 
-from app.agents.router import classify_by_rules, detect_document_kind
+from app.agents.router import (
+    classify_by_rules,
+    detect_document_kind,
+    wants_document_template,
+)
 from app.agents.state import Intent
 
 
@@ -254,3 +258,93 @@ class TestQuestionAboutFormIsNotRequestForForm:
         assert imperative is not None
         assert descriptive["intent"] == Intent.QUESTION.value
         assert imperative["intent"] == Intent.TEMPLATE_REQUEST.value
+
+
+class TestOrganizerScenarios:
+    """Обращения из присланных организаторами сценариев.
+
+    Эти пять примеров — проверка не формулировок, а ветвления: каждый
+    задевает отдельную ветку графа, и ошибка в маршруте стоит дороже
+    неточности в ответе. На первом сценарии помощник вместо разъяснения
+    порядка сразу спрашивал значения полей бланка, на третьем — начинал
+    заполнять новый приказ вместо проверки готового.
+    """
+
+    def test_how_to_prepare_order_is_a_question(self) -> None:
+        """Просьба объяснить порядок не уходит в выдачу бланка.
+
+        «Что для этого нужно сделать?» стоит второй фразой и рядом с
+        глаголом «подготовить»: сотрудник просит разъяснение, а бланк
+        предлагается после него узлом ``offer``.
+        """
+        result = classify_by_rules(
+            "Мне нужно подготовить приказ о вводе информационной системы "
+            "в эксплуатацию. Что для этого нужно сделать?"
+        )
+
+        assert result is not None
+        assert result["intent"] == Intent.QUESTION.value
+        assert result["document_kind"] == "order"
+        assert result["needs_clarification"] is False
+
+    def test_prepared_document_with_check_request_goes_to_check(self) -> None:
+        """«Я подготовил приказ, проверь его» — проверка, а не изготовление.
+
+        Дополнение после «проверь» в живой речи — местоимение, поэтому
+        название вида документа рядом с глаголом не требуется.
+        """
+        result = classify_by_rules(
+            "Я подготовил приказ на основе модульного документа. "
+            "Проверь его, пожалуйста, и подскажи, что делать дальше"
+        )
+
+        assert result is not None
+        assert result["intent"] == Intent.DOCUMENT_CHECK.value
+
+    def test_bare_check_verb_is_not_a_document_check(self) -> None:
+        """«Проверь, какой срок» не превращает вопрос в проверку файла.
+
+        Правило применяется только вместе с признаком готовой работы или
+        названным видом документа, иначе оно забирало бы обычные вопросы.
+        """
+        result = classify_by_rules("Проверь, какой срок согласования установлен")
+
+        assert result is None or result["intent"] != Intent.DOCUMENT_CHECK.value
+
+
+class TestDocumentPreparationSignal:
+    """Признак подготовки документа, по которому предлагается модуль.
+
+    Признак должен срабатывать на побуждении изготовить документ и
+    молчать на вопросе об условиях. Без глагола изготовления правило
+    ловило «требуется сопроводительное письмо» — и на вопрос о письме
+    помощник предлагал модуль приказа.
+    """
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "Мне нужно подготовить приказ о вводе системы в эксплуатацию",
+            "Надо оформить распоряжение о создании рабочей группы",
+            "Готовлю служебную записку, с чего начать?",
+        ],
+    )
+    def test_preparation_is_recognised(self, question: str) -> None:
+        """Побуждение изготовить документ распознаётся."""
+        assert wants_document_template(question, detect_document_kind(question))
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "В каких случаях требуется сопроводительное письмо?",
+            "Какой срок согласования приказа?",
+            "Кто визирует распоряжение?",
+        ],
+    )
+    def test_question_about_conditions_is_not_preparation(self, question: str) -> None:
+        """Вопрос об условиях подготовкой документа не считается."""
+        assert not wants_document_template(question, detect_document_kind(question))
+
+    def test_no_document_kind_means_no_offer(self) -> None:
+        """Без названного вида документа модуль предлагать нечему."""
+        assert not wants_document_template("Мне нужно подготовить что-нибудь", "")

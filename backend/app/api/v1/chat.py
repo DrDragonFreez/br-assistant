@@ -19,7 +19,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -29,6 +29,7 @@ from sqlalchemy.orm import selectinload
 from sse_starlette.sse import EventSourceResponse
 
 from app.agents.graph import run_assistant
+from app.agents.router import accepts_joint_filling
 from app.agents.state import AnswerStatus, AssistantState
 from app.api.v1.deps import (
     AccessLevels,
@@ -54,12 +55,15 @@ from app.db.models import (
     ChatMessage,
     ChatSession,
     DocumentChunk,
+    DocumentTemplate,
+    GeneratedDocument,
     MessageCitation,
     MessageFeedback,
     User,
 )
 from app.db.postgres import session_scope
 from app.db.redis import cache_get, cache_set, slots_get
+from app.workers.tasks import generate_document
 from app.rag.generator import extract_citations, get_generator
 from app.rag.prompts import NO_ANSWER_MARKER, NO_ANSWER_MESSAGE, build_answer_prompt
 from app.rag.reranker import get_reranker
@@ -99,6 +103,11 @@ def _cacheable_state(state: AssistantState) -> dict[str, Any]:
     Фрагменты поиска и трасса узлов в кеш не кладутся: они весят больше
     самого ответа и при повторном обращении не нужны.
 
+    Подобранный модуль и перечень визирования кладутся обязательно.
+    Без них повторный ответ противоречил сам себе: текст предлагал
+    нажать «Заполнить», а кнопки под ответом не было — список модулей
+    терялся при попадании в кеш.
+
     Args:
         state: Итоговое состояние графа.
 
@@ -116,8 +125,69 @@ def _cacheable_state(state: AssistantState) -> dict[str, Any]:
         "latency_ms",
         "prompt_tokens",
         "completion_tokens",
+        "template_candidates",
+        "approval_route",
     )
     return {key: state.get(key) for key in keys if state.get(key) is not None}
+
+
+async def _queue_document_build(
+    db: AsyncSession,
+    *,
+    user: User,
+    session_id: uuid.UUID,
+    template_code: str,
+    values: dict[str, Any],
+) -> uuid.UUID | None:
+    """Ставит сборку черновика, собранного в диалоге.
+
+    Тот же путь, что и у формы: заводится запись о черновике и
+    ставится фоновая задача сборки. Без этого диалог доходил до
+    последнего поля и обрывался — файла не появлялось, хотя помощник
+    о нём сообщал.
+
+    Args:
+        db: Сессия БД.
+        user: Текущий пользователь.
+        session_id: Диалог, в котором собраны поля.
+        template_code: Код модуля.
+        values: Собранные значения полей.
+
+    Returns:
+        Идентификатор записи о черновике либо None, если модуль не найден.
+    """
+    template = await db.scalar(
+        select(DocumentTemplate).where(DocumentTemplate.code == template_code)
+    )
+    if template is None:
+        logger.warning("document_template_missing", template_code=template_code)
+        return None
+
+    record = GeneratedDocument(
+        user_id=user.id,
+        template_id=template.id,
+        session_id=session_id,
+        status="pending",
+        filled_fields=values,
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+    db.add(record)
+    await db.flush()
+
+    task = generate_document.delay(
+        document_id=str(record.id),
+        template_code=template.code,
+        values=values,
+        user_id=str(user.id),
+    )
+    record.task_id = task.id
+
+    logger.info(
+        "document_build_queued_from_chat",
+        template_code=template.code,
+        fields=len(values),
+    )
+    return record.id
 
 
 async def _get_session_or_404(
@@ -145,6 +215,66 @@ async def _get_session_or_404(
         # Аудитор и администратор вправе просматривать чужие диалоги.
         raise PermissionDeniedError("Диалог принадлежит другому пользователю")
     return chat_session
+
+
+def resolve_template_context(
+    *,
+    message: str,
+    requested_code: str,
+    previous_status: str,
+    previous_extra: dict[str, Any] | None,
+) -> tuple[str, str]:
+    """Определяет модуль и текст обращения с учётом предыдущего ответа.
+
+    Два случая, когда модуль известен из диалога, а не из запроса:
+
+    1. Предыдущий ответ — шаг заполнения. Код модуля берётся из него,
+       даже если клиент его не прислал: фронтенд запоминает код только
+       при нажатии кнопки «Заполнить», и после ответа словами второй
+       шаг терял модуль.
+    2. Предыдущий ответ предложил модуль, а сотрудник согласился
+       заполнить вместе. Запускается тот же путь, что у кнопки
+       «Заполнить»: обращение «Заполним бланк «…»».
+
+    Args:
+        message: Реплика сотрудника.
+        requested_code: Код модуля из запроса клиента.
+        previous_status: Статус предыдущего ответа помощника.
+        previous_extra: Служебные данные предыдущего ответа.
+
+    Returns:
+        Пара ``(код модуля, текст обращения для графа)``.
+    """
+    if requested_code:
+        return requested_code, message
+
+    extra = previous_extra or {}
+    if previous_status == AnswerStatus.TEMPLATE_FILLING.value and extra.get("template_code"):
+        return str(extra["template_code"]), message
+
+    offered = extra.get("offered_template") or {}
+    if offered.get("code") and accepts_joint_filling(message):
+        return str(offered["code"]), f"Заполним бланк «{offered.get('name', '')}»"
+
+    return "", message
+
+
+async def _last_assistant_message(db: AsyncSession, session_id: uuid.UUID) -> ChatMessage | None:
+    """Возвращает последний ответ помощника в диалоге.
+
+    Args:
+        db: Сессия БД.
+        session_id: Идентификатор диалога.
+
+    Returns:
+        Последнее сообщение помощника либо None.
+    """
+    return await db.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id, ChatMessage.role == "assistant")
+        .order_by(ChatMessage.created_at.desc())
+        .limit(1)
+    )
 
 
 async def _load_history(db: AsyncSession, session_id: uuid.UUID) -> list[dict[str, str]]:
@@ -287,12 +417,22 @@ async def ask(
 
     stored_slots = await slots_get(str(chat_session.id))
 
+    previous = await _last_assistant_message(db, chat_session.id) if history else None
+    template_code, graph_question = resolve_template_context(
+        message=payload.message,
+        requested_code=payload.template_code,
+        previous_status=previous.answer_status if previous else "",
+        previous_extra=previous.extra if previous else None,
+    )
+    if template_code and not payload.template_code:
+        logger.info("template_resumed_from_dialog", template_code=template_code)
+
     # Кеш отвечает только на самостоятельные вопросы: заполнение бланка,
     # уточнения и ответы с опорой на историю диалога зависят от состояния,
     # и переиспользовать их нельзя.
     cache_key = (
         _answer_cache_key(payload.message, access_levels)
-        if not payload.template_code and not stored_slots and not history
+        if not template_code and not stored_slots and not history
         else ""
     )
     state: AssistantState | None = None
@@ -307,7 +447,7 @@ async def ask(
 
     if state is None:
         state = await run_assistant(
-            question=payload.message,
+            question=graph_question,
             session_id=str(chat_session.id),
             user_id=str(user.id),
             user_role=user.role.value,
@@ -315,7 +455,7 @@ async def ask(
             history=history,
             request_id=request_id,
             filled_fields=stored_slots,
-            template_code=payload.template_code,
+            template_code=template_code,
         )
 
         # В кеш попадают только состоявшиеся ответы: отказы, уточнения
@@ -341,6 +481,16 @@ async def ask(
             "node_trace": state.get("node_trace", []),
             "used_fallback": state.get("used_fallback", False),
             "template_code": state.get("template_code", ""),
+            # Модуль, предложенный узлом offer: ответ «вместе» на следующей
+            # реплике запускает по нему заполнение в диалоге.
+            "offered_template": next(
+                (
+                    {"code": item.get("code", ""), "name": item.get("name", "")}
+                    for item in state.get("template_candidates") or []
+                    if isinstance(item, dict) and item.get("code")
+                ),
+                None,
+            ),
             # Признак нужен при разборе метрик: ответ из кеша не проходил
             # ни поиск, ни модель, и его задержку нельзя смешивать
             # с задержкой полного контура.
@@ -368,6 +518,18 @@ async def ask(
         },
     )
 
+    # Поля собраны в диалоге: дальше тот же путь, что и у формы —
+    # запись о черновике и фоновая сборка файла.
+    document_id: uuid.UUID | None = None
+    if state.get("answer_status") == AnswerStatus.TEMPLATE_READY.value:
+        document_id = await _queue_document_build(
+            db,
+            user=user,
+            session_id=chat_session.id,
+            template_code=state.get("template_code", ""),
+            values=state.get("filled_fields", {}),
+        )
+
     top_score = float(state.get("top_score", 0.0))
 
     return ChatResponse(
@@ -386,6 +548,7 @@ async def ask(
         from_cache=from_cache,
         filled_fields=state.get("filled_fields", {}),
         missing_fields=state.get("missing_fields", []),
+        generated_document_id=document_id,
     )
 
 

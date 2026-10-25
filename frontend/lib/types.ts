@@ -138,6 +138,8 @@ export interface UiMessage extends Omit<ChatMessage, 'id'> {
   model_name?: string;
   /** Ответ отдан из кеша: задержку нельзя сравнивать с полным контуром. */
   from_cache?: boolean;
+  /** Черновик, собранный по итогам заполнения модуля в диалоге. */
+  generated_document_id?: string | null;
   error?: string;
 }
 
@@ -193,7 +195,14 @@ export interface GeneratedDocument {
   download_url: string;
 }
 
-export type Severity = 'critical' | 'major' | 'minor';
+/**
+ * Уровень отметки в отчёте проверки.
+ *
+ * `info` — не несоответствие, а реквизит следующего этапа: дата и
+ * номер вносятся при регистрации, подпись появляется после
+ * согласования. В оценку такие отметки не входят.
+ */
+export type Severity = 'critical' | 'major' | 'minor' | 'info';
 
 export interface Violation {
   severity: Severity;
@@ -230,6 +239,14 @@ export interface ValidationReport {
   created_at: string;
   summary: string;
   citations: Citation[];
+  next_steps?: NextStep[];
+}
+
+/** Шаг дальнейшего порядка действий после проверки проекта. */
+export interface NextStep {
+  step: number;
+  action: string;
+  clause: string;
 }
 
 // ─────────────────────────── База знаний ───────────────────────────

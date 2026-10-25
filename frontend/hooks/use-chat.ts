@@ -58,12 +58,28 @@ export function useChat(options: UseChatOptions = {}) {
 
   const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
   const [sessionId, setSessionId] = useState<string | null>(initialSessionId);
-  const [mode, setMode] = useState<ChatMode>('stream');
+  // По умолчанию полный контур, а не поток. Потоковая ветка собрана
+  // отдельно от графа: в ней нет ни критика, ни подбора модуля, ни
+  // перечня визирующих подразделений — то есть ровно того, ради чего
+  // сотрудник и обращается к помощнику при подготовке документа.
+  // Поток остаётся переключателем для вопросов, где важна скорость
+  // первого слова.
+  const [mode, setMode] = useState<ChatMode>('full');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   /** Текущий запрос: нужен, чтобы прервать поток при уходе со страницы. */
   const abortRef = useRef<AbortController | null>(null);
+  /** Текущий диалог без задержки на перерисовку. */
+  const sessionRef = useRef<string | null>(initialSessionId);
+  /**
+   * Диалог, о создании которого ещё не сообщено наружу.
+   *
+   * Сообщать сразу нельзя: получатель пишет идентификатор в адрес
+   * страницы, Next выполняет это как переход, экран монтируется заново
+   * и незавершённый поток обрывается.
+   */
+  const pendingSessionRef = useRef('');
   /** Код шаблона, если идёт пошаговое заполнение документа. */
   const templateCodeRef = useRef('');
 
@@ -91,16 +107,19 @@ export function useChat(options: UseChatOptions = {}) {
     });
   }, []);
 
-  const applySession = useCallback(
-    (id: string) => {
-      setSessionId((current) => {
-        if (current === id) return current;
-        onSessionCreated?.(id);
-        return id;
-      });
-    },
-    [onSessionCreated],
-  );
+  /**
+   * Запоминает диалог, в котором идёт обращение.
+   *
+   * Наружу о новом диалоге сообщается не здесь, а по завершении
+   * обращения: получатель меняет адрес страницы, а переход в середине
+   * потока обрывает его.
+   */
+  const applySession = useCallback((id: string) => {
+    if (sessionRef.current === id) return;
+    sessionRef.current = id;
+    pendingSessionRef.current = id;
+    setSessionId(id);
+  }, []);
 
   /** Отправляет обращение в выбранном режиме. */
   const send = useCallback(
@@ -150,6 +169,7 @@ export function useChat(options: UseChatOptions = {}) {
             latency_ms: response.latency_ms,
             model_name: response.model_name,
             from_cache: response.from_cache,
+            generated_document_id: response.generated_document_id,
             isStreaming: false,
           });
         } else {
@@ -192,6 +212,20 @@ export function useChat(options: UseChatOptions = {}) {
           patchLast({ isStreaming: false });
           return;
         }
+        // Обращение удалено, пока оно было открыто: продолжать слать в
+        // него сообщения бессмысленно, каждый повтор давал бы тот же
+        // ответ. Состояние диалога очищается, и повтор уходит в новое
+        // обращение.
+        if (caught instanceof ApiError && caught.status === 404) {
+          sessionRef.current = null;
+          pendingSessionRef.current = '';
+          setSessionId(null);
+          const gone = 'Обращение было удалено. Нажмите «Повторить» — вопрос уйдёт в новое.';
+          setError(gone);
+          patchLast({ answer_status: 'error', content: gone, isStreaming: false });
+          return;
+        }
+
         const detail =
           caught instanceof ApiError
             ? caught.message
@@ -201,9 +235,18 @@ export function useChat(options: UseChatOptions = {}) {
       } finally {
         abortRef.current = null;
         setBusy(false);
+
+        // Адрес страницы меняется только теперь. Раньше он менялся по
+        // первому событию потока, и вызванный этим переход обрывал сам
+        // поток, не дав прийти ни одному токену.
+        const created = pendingSessionRef.current;
+        if (created) {
+          pendingSessionRef.current = '';
+          onSessionCreated?.(created);
+        }
       }
     },
-    [appendToLast, applySession, busy, mode, patchLast, sessionId],
+    [appendToLast, applySession, busy, mode, onSessionCreated, patchLast, sessionId],
   );
 
   /** Прерывает текущий поток. */
@@ -226,6 +269,10 @@ export function useChat(options: UseChatOptions = {}) {
   const reset = useCallback(() => {
     abortRef.current?.abort();
     templateCodeRef.current = '';
+    // Ссылки сбрасываются вместе с состоянием: иначе следующий диалог
+    // сравнивался бы с идентификатором предыдущего.
+    sessionRef.current = null;
+    pendingSessionRef.current = '';
     setMessages([]);
     setSessionId(null);
     setError('');

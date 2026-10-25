@@ -74,16 +74,30 @@ interface RequestOptions {
   noRetry?: boolean;
 }
 
+/**
+ * Итог попытки обновления токенов.
+ *
+ * `rejected` отличается от `unavailable` намеренно: первое означает, что
+ * сервер признал refresh-токен недействительным и входить нужно заново,
+ * второе — что ответа не получилось добиться (сеть, 429, 5xx). Стирать
+ * сессию во втором случае нельзя: пользователь потеряет открытые
+ * диалоги из-за временной помехи.
+ */
+type RefreshOutcome = 'ok' | 'rejected' | 'unavailable';
+
+/** Ответы, которые означают недействительный refresh-токен. */
+const TOKEN_REJECTED_STATUSES = [400, 401, 403, 422];
+
 /** Текущее обновление токенов; остальные запросы ждут его, а не плодят новые. */
-let refreshPromise: Promise<boolean> | null = null;
+let refreshPromise: Promise<RefreshOutcome> | null = null;
 
 /**
  * Обновляет пару токенов по refresh-токену.
- * @returns true, если токены обновлены.
+ * @returns Итог попытки: обновлено, отвергнуто или недоступно.
  */
-async function refreshTokens(): Promise<boolean> {
+async function refreshTokens(): Promise<RefreshOutcome> {
   const refreshToken = getRefreshToken();
-  if (!refreshToken) return false;
+  if (!refreshToken) return 'rejected';
 
   if (!refreshPromise) {
     refreshPromise = (async () => {
@@ -94,13 +108,16 @@ async function refreshTokens(): Promise<boolean> {
           body: JSON.stringify({ refresh_token: refreshToken }),
         });
         if (!response.ok) {
-          clearTokens();
-          return false;
+          if (TOKEN_REJECTED_STATUSES.includes(response.status)) {
+            clearTokens();
+            return 'rejected';
+          }
+          return 'unavailable';
         }
         setTokens((await response.json()) as TokenResponse);
-        return true;
+        return 'ok';
       } catch {
-        return false;
+        return 'unavailable';
       } finally {
         refreshPromise = null;
       }
@@ -121,7 +138,7 @@ async function refreshTokens(): Promise<boolean> {
 export async function ensureFreshToken(): Promise<boolean> {
   if (!isAccessTokenExpired()) return true;
   if (!getRefreshToken()) return false;
-  return refreshTokens();
+  return (await refreshTokens()) === 'ok';
 }
 
 /** Разбирает тело ошибки, не падая на пустом или не-JSON ответе. */
@@ -165,11 +182,12 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   });
 
   // Токен мог быть отозван или истечь раньше срока — пробуем один раз.
+  // Токены стираются только если сервер отверг refresh: при недоступном
+  // сервисе сессия сохраняется до следующей попытки.
   if (response.status === 401 && !anonymous && !noRetry) {
-    if (await refreshTokens()) {
+    if ((await refreshTokens()) === 'ok') {
       return request<T>(path, { ...options, noRetry: true });
     }
-    clearTokens();
   }
 
   if (!response.ok) {

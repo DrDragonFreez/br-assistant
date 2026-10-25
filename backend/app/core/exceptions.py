@@ -47,8 +47,28 @@ class AppError(Exception):
         super().__init__(self.message)
 
     def to_dict(self, request_id: str | None = None) -> dict[str, Any]:
-        """Сериализует исключение в тело HTTP-ответа."""
-        return {"detail": self.message, "code": self.code, "request_id": request_id}
+        """Сериализует исключение в тело HTTP-ответа.
+
+        Если в контексте есть ключ ``fields``, имена полей попадают в
+        тело ответа: по ним интерфейс подсвечивает места, которые нужно
+        исправить. Перечень в тексте сообщения для этого не годится —
+        там заголовки для чтения, а не имена.
+
+        Args:
+            request_id: Сквозной идентификатор запроса.
+
+        Returns:
+            Тело ответа.
+        """
+        body: dict[str, Any] = {
+            "detail": self.message,
+            "code": self.code,
+            "request_id": request_id,
+        }
+        fields = self.context.get("fields")
+        if isinstance(fields, list):
+            body["fields"] = [str(item) for item in fields]
+        return body
 
 
 # ─────────────────────────── АУТЕНТИФИКАЦИЯ / ДОСТУП ───────────────────────────

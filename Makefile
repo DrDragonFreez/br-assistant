@@ -3,9 +3,15 @@ SHELL := /bin/bash
 COMPOSE := docker compose
 BACKEND := $(COMPOSE) exec -T backend
 
+# Python хоста для сквозной проверки и прогрева кеша. На Windows
+# `python` в PATH бывает заглушкой Microsoft Store, которая ничего не
+# запускает, поэтому сначала берётся интерпретатор из .venv. Обоим
+# скриптам хватает стандартной библиотеки.
+HOST_PY := $(firstword $(wildcard .venv/Scripts/python.exe .venv/bin/python) python3)
+
 .PHONY: help env up up-cpu down restart build rebuild logs logs-backend ps \
         seed index status templates templates-check migrate migration \
-        shell-backend shell-db smoke test test-integration test-cov \
+        shell-backend shell-db smoke warmup test test-integration test-cov \
         models eval clean nuke up-rerank
 
 help: ## Показать список команд
@@ -94,7 +100,13 @@ eval: ## Оценка качества. Быстрый прогон: make eval A
 	$(BACKEND) python -m app.services.ragas_eval $(ARGS)
 
 smoke: ## Сквозная проверка поднятого контура (вход, ответ, цитаты, отказ)
-	python scripts/smoke_test.py
+	$(HOST_PY) scripts/smoke_test.py
+
+warmup: ## Прогреть кеш демонстрационными вопросами (перед защитой)
+	# Ответы кешируются на час. Генератор даёт разброс между запусками,
+	# и примерно в одном прогоне из нескольких критик отклоняет ответ:
+	# скрипт повторяет такой вопрос, чтобы в кеше остался удачный.
+	$(HOST_PY) scripts/warmup_demo.py
 
 test: ## Запустить тесты (интеграционные пропускаются)
 	# -p no:cacheprovider: каталог /app принадлежит root, и pytest

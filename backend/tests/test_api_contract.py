@@ -24,6 +24,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+# Доменная ошибка импортируется под псевдонимом: имя ValidationError
+# в этом модуле уже занято одноимённой ошибкой pydantic.
+from app.core.exceptions import ValidationError as DomainValidationError
 from app.api.v1.schemas import LoginRequest
 from app.core.config import Settings, settings
 
@@ -179,3 +182,47 @@ class TestInternalEmailDomains:
         for address in ("user@example.invalid", "user@example.test"):
             with pytest.raises(ValidationError):
                 LoginRequest(email=address, password="x")
+
+
+class TestMissingFieldsReachTheInterface:
+    """Перечень незаполненных полей в теле ответа.
+
+    Интерфейс подсвечивает незаполненные места по именам полей из
+    ответа. Пока имена уходили только в журнал, сотрудник получал
+    перечень из десятка заголовков и искал их в форме глазами —
+    при том, что форма знала, какие поля подсветить.
+
+    Проверяется именно контракт: имена полей в `fields`, заголовки
+    для чтения — в тексте сообщения.
+    """
+
+    def test_field_names_are_returned_in_body(self) -> None:
+        """Имена полей попадают в тело ответа."""
+        error = DomainValidationError(
+            "Не заполнены обязательные поля: Наименование системы",
+            code="missing_required_fields",
+            context={"fields": ["component_title", "signer"]},
+        )
+
+        body = error.to_dict("req-1")
+
+        assert body["fields"] == ["component_title", "signer"]
+        assert body["code"] == "missing_required_fields"
+
+    def test_labels_stay_in_the_message(self) -> None:
+        """Заголовки остаются в сообщении, а не подменяют имена."""
+        error = DomainValidationError(
+            "Не заполнены обязательные поля: Наименование системы",
+            context={"fields": ["component_title"]},
+        )
+
+        body = error.to_dict(None)
+
+        assert "Наименование системы" in body["detail"]
+        assert "component_title" not in body["detail"]
+
+    def test_errors_without_fields_do_not_carry_the_key(self) -> None:
+        """Ошибка без перечня полей не добавляет пустой ключ."""
+        body = DomainValidationError("Загружен пустой файл").to_dict(None)
+
+        assert "fields" not in body

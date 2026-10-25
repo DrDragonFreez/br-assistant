@@ -16,6 +16,9 @@
                     |          | повторная генерация
                     v          |
                  critic -------+
+                    |
+                    v
+                  offer  (переход от ответа к действию)
 
 Ключевые решения:
 
@@ -26,6 +29,11 @@
   Бесконечная саморефлексия съела бы время ответа.
 * **Ошибки узлов не роняют граф.** Каждый узел ловит исключения и возвращает
   состояние с признаком ошибки.
+* **Ответ заканчивается действием.** Узел ``offer`` дополняет разъяснение
+  подходящим модулем, перечнем визирующих подразделений и предложением
+  подготовить документ. Отдельным узлом, а не внутри генератора: текст
+  добавляется детерминированно и проверять его критиком незачем —
+  данные берутся из реестра шаблонов, выдумать там нечего.
 """
 
 from __future__ import annotations
@@ -38,9 +46,13 @@ from langgraph.graph import END, START, StateGraph
 from app.agents.clarifier import clarify_node
 from app.agents.critic import critic_node, should_regenerate
 from app.agents.doc_builder import build_document_node
-from app.agents.router import route_node
+from app.agents.router import route_node, wants_document_template
 from app.agents.state import AnswerStatus, AssistantState, Intent, create_initial_state
-from app.agents.template_matcher import match_template_node
+from app.agents.template_matcher import (
+    find_templates,
+    match_template_node,
+    template_to_payload,
+)
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.metrics import (
@@ -305,6 +317,141 @@ async def static_response_node(state: AssistantState) -> dict[str, Any]:
     }
 
 
+# Приглашение загрузить документ на проверку. Проверка выполняется по
+# файлу, поэтому без загрузки помощник может только объяснить порядок.
+UPLOAD_INVITATION = (
+    "Загрузите проект документа на вкладке «Проверка» справа — сверю его с "
+    "требованиями инструкции и с использованным модулем, покажу незаполненные "
+    "поля, оставшиеся элементы шаблона и ошибки оформления.\n\n"
+    "Пока — порядок дальнейших действий по инструкции:"
+)
+
+
+def format_approval_route(route: list[dict[str, Any]]) -> str:
+    """Формирует перечень обязательного визирования.
+
+    Строки берутся из матрицы обязательного визирования: порядок,
+    подразделение и срок рассмотрения. Срок выводится рядом с
+    подразделением — по нему сотрудник планирует согласование.
+
+    Строки без названия подразделения пропускаются: пункт с пустым
+    подразделением хуже короткого перечня.
+
+    Args:
+        route: Строки матрицы визирования из реестра шаблонов.
+
+    Returns:
+        Текст перечня либо пустая строка.
+    """
+    rows = [item for item in route if isinstance(item, dict)]
+    rows.sort(key=lambda item: item.get("order") or 0)
+
+    lines: list[str] = []
+    for position, item in enumerate(rows, start=1):
+        unit = str(item.get("department") or item.get("unit") or item.get("name") or "").strip()
+        if not unit:
+            continue
+        line = f"{position}. {unit}"
+        term = item.get("term_days")
+        if term:
+            line += f" — {term} раб. дн."
+        lines.append(line)
+
+    if not lines:
+        return ""
+    return (
+        "Обязательное визирование по матрице — "
+        f"{len(lines)} подразделения:\n" + "\n".join(lines)
+    )
+
+
+async def offer_action_node(state: AssistantState) -> dict[str, Any]:
+    """Узел графа: дополняет разъяснение переходом к действию.
+
+    Сотруднику, который готовит документ, нужен не только порядок, но и
+    бланк. Подходящий модуль и перечень визирующих подразделений берутся
+    из реестра шаблонов, поэтому выдумать их невозможно: это данные, а
+    не генерация.
+
+    Args:
+        state: Текущее состояние графа.
+
+    Returns:
+        Обновление состояния с дополненным ответом и списком модулей.
+    """
+    started = time.perf_counter()
+    answer = state.get("answer", "")
+    intent = state.get("intent", "")
+
+    try:
+        if intent == Intent.DOCUMENT_CHECK.value:
+            return {
+                "answer": f"{UPLOAD_INVITATION}\n\n{answer}".strip(),
+                "node_trace": ["offer:upload"],
+            }
+
+        document_kind = state.get("document_kind", "")
+        candidates = await find_templates(
+            question=state.get("question", ""),
+            document_kind=document_kind,
+            user_role=state.get("user_role", "employee"),
+        )
+        # Вид подобранного модуля должен совпадать с видом документа из
+        # обращения. Подбор возвращает лучший по оценке шаблон из всего
+        # реестра, и без этой сверки на вопрос о письме предлагался
+        # модуль приказа — предложение не по делу хуже его отсутствия.
+        candidates = [
+            item for item in candidates if item[0].doc_kind == document_kind
+        ]
+        if not candidates:
+            logger.info("offer_template_kind_mismatch", document_kind=document_kind)
+            return {"node_trace": ["offer:no_template"]}
+
+        best_template, best_score = candidates[0]
+        payload = template_to_payload(best_template, best_score)
+
+        parts = [
+            answer.rstrip(),
+            "",
+            f"Для такого документа в реестре есть модульный документ — "
+            f"«{best_template.name}». Он содержит обязательные элементы, "
+            f"структуру заново набирать не нужно.",
+        ]
+
+        route = format_approval_route(payload["required_approvals"])
+        if route:
+            parts.extend(["", route])
+
+        parts.extend(
+            [
+                "",
+                "Заполните модуль самостоятельно — кнопка «Заполнить» ниже, — либо "
+                "подготовлю проект вместе с вами: задам необходимые вопросы и "
+                "соберу готовый файл. Как удобнее?",
+            ]
+        )
+
+        logger.info(
+            "offer_template_attached",
+            template_code=best_template.code,
+            score=round(best_score, 3),
+        )
+        return {
+            "answer": "\n".join(parts).strip(),
+            "template_candidates": [payload],
+            "approval_route": payload["required_approvals"],
+            "node_trace": ["offer:template"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        # Разъяснение уже готово и ценно само по себе: сбой подбора
+        # бланка не должен отменять ответ.
+        logger.warning("offer_action_failed", error=str(exc))
+        graph_node_errors_total.labels(node="offer").inc()
+        return {"node_trace": ["offer:error"]}
+    finally:
+        graph_node_latency_seconds.labels(node="offer").observe(time.perf_counter() - started)
+
+
 async def regenerate_counter_node(state: AssistantState) -> dict[str, Any]:
     """Узел графа: увеличивает счётчик повторных генераций.
 
@@ -361,6 +508,32 @@ def route_after_template_match(state: AssistantState) -> str:
     return "build_document"
 
 
+def needs_action_offer(state: AssistantState) -> bool:
+    """Проверяет, нужно ли дополнять ответ переходом к действию.
+
+    Дополнение уместно только при состоявшемся ответе: к честному отказу
+    «в базе знаний нет информации» предлагать бланк нельзя — вышло бы,
+    что помощник отказал и тут же начал что-то предлагать.
+
+    Args:
+        state: Состояние графа.
+
+    Returns:
+        True, если ответ нужно дополнить.
+    """
+    if state.get("answer_status") != AnswerStatus.ANSWERED.value:
+        return False
+    if state.get("template_candidates"):
+        return False
+
+    intent = state.get("intent", "")
+    if intent == Intent.DOCUMENT_CHECK.value:
+        return True
+    if intent not in {Intent.QUESTION.value, Intent.APPROVAL_ROUTE.value}:
+        return False
+    return wants_document_template(state.get("question", ""), state.get("document_kind", ""))
+
+
 def route_after_critic(state: AssistantState) -> str:
     """Выбирает ветку после проверки ответа.
 
@@ -368,9 +541,11 @@ def route_after_critic(state: AssistantState) -> str:
         state: Состояние графа.
 
     Returns:
-        ``regenerate`` для повторной генерации либо ``__end__``.
+        ``regenerate``, ``offer`` либо ``__end__``.
     """
-    return "regenerate" if should_regenerate(state) else END
+    if should_regenerate(state):
+        return "regenerate"
+    return "offer" if needs_action_offer(state) else END
 
 
 # ═══════════════════════════ СБОРКА ГРАФА ═══════════════════════════
@@ -391,6 +566,7 @@ def build_graph() -> Any:
     graph.add_node("critic", critic_node)
     graph.add_node("regenerate", regenerate_counter_node)
     graph.add_node("match_template", match_template_node)
+    graph.add_node("offer", offer_action_node)
     graph.add_node("build_document", build_document_node)
 
     graph.add_edge(START, "route")
@@ -416,9 +592,10 @@ def build_graph() -> Any:
     graph.add_conditional_edges(
         "critic",
         route_after_critic,
-        {"regenerate": "regenerate", END: END},
+        {"regenerate": "regenerate", "offer": "offer", END: END},
     )
     graph.add_edge("regenerate", "generate")
+    graph.add_edge("offer", END)
 
     graph.add_conditional_edges(
         "match_template",

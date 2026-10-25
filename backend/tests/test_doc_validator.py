@@ -62,8 +62,8 @@ def test_valid_document_has_no_violations() -> None:
     assert check_formal_requisites(VALID_MEMO) == []
 
 
-def test_empty_document_reports_critical_requisites() -> None:
-    """В пустом документе отсутствуют все критичные реквизиты."""
+def test_empty_document_reports_all_requisites() -> None:
+    """В пустом документе не обнаружен ни один реквизит."""
     violations = check_formal_requisites("")
     fields = {item.field_name for item in violations}
 
@@ -71,13 +71,21 @@ def test_empty_document_reports_critical_requisites() -> None:
     assert all(item.recommendation for item in violations)
 
 
-def test_missing_date_is_critical() -> None:
-    """Отсутствие даты — критичное несоответствие, а не замечание."""
+def test_missing_date_is_informational() -> None:
+    """Отсутствие даты — сведение о следующем этапе, а не нарушение.
+
+    Дата вносится в РК при регистрации [п. 7.1], то есть после
+    подписания, — в проекте её быть не может. Подробнее поведение
+    закреплено в ``test_deferred_requisites``.
+    """
     text = VALID_MEMO.replace("от 15 марта 2026 года", "")
-    violations = [item for item in check_formal_requisites(text) if item.field_name == "дата документа"]
+    violations = [
+        item for item in check_formal_requisites(text) if item.field_name == "дата документа"
+    ]
 
     assert len(violations) == 1
-    assert violations[0].severity == "critical"
+    assert violations[0].severity == "info"
+    assert violations[0].clause == "7.1"
 
 
 def test_short_body_is_reported() -> None:

@@ -106,7 +106,8 @@ def format_ready_message(
         Текст сообщения с итогом и дальнейшими шагами.
     """
     lines = [
-        f"Черновик документа «{template_name}» сформирован — файл доступен для скачивания.",
+        f"Все обязательные поля для документа «{template_name}» собраны. "
+        f"Готовлю файл — он появится здесь через несколько секунд.",
         "",
         format_progress(template_name=template_name, filled=filled, fields=fields),
     ]

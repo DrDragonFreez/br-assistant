@@ -16,6 +16,16 @@ import { ApiError, API_BASE, ensureFreshToken } from './api';
 import { getAccessToken } from './auth';
 import type { Citation } from './types';
 
+/**
+ * Сколько ждать очередной порции данных.
+ *
+ * sse-starlette присылает служебный комментарий каждые 15 секунд,
+ * чтобы Nginx не закрыл соединение по таймауту. Поэтому полторы минуты
+ * полной тишины означают, что соединение мертво, а не что модель долго
+ * думает: пока она думает, комментарии всё равно идут.
+ */
+const IDLE_TIMEOUT_MS = 90_000;
+
 /** Событие потока в разобранном виде. */
 export interface StreamEvent {
   event: string;
@@ -56,7 +66,12 @@ function parseEventBlock(raw: string): StreamEvent | null {
   let event = 'message';
   const dataLines: string[] = [];
 
-  for (const line of raw.split('\n')) {
+  // Строки разделяются через \r\n: так их шлёт sse-starlette, так же они
+  // приходят и за прокси. Деление только по \n оставляло возврат каретки
+  // в конце значения, и имя события получалось «done\r» вместо «done» —
+  // ни одна ветка разбора не совпадала, события молча отбрасывались,
+  // а поток выглядел зависшим.
+  for (const line of raw.split(/\r?\n/)) {
     if (!line || line.startsWith(':')) continue;
 
     const separator = line.indexOf(':');
@@ -89,7 +104,8 @@ function parseData<T>(data: string): T | null {
  * @param handlers Обработчики событий.
  * @param signal Позволяет прервать поток при уходе со страницы.
  *
- * @throws ApiError Если сервис отклонил запрос до начала потока.
+ * @throws ApiError Если сервис отклонил запрос до начала потока либо
+ *   соединение оборвалось, не дойдя до события ``done``.
  */
 export async function streamChat(
   payload: { message: string; session_id?: string | null; template_code?: string },
@@ -133,6 +149,19 @@ export async function streamChat(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  /** Пришло событие, завершающее обращение по существу. */
+  let finished = false;
+  /** Соединение закрыто сторожем простоя, а не сервисом. */
+  let timedOut = false;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const watchIdle = (): void => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOut = true;
+      void reader.cancel();
+    }, IDLE_TIMEOUT_MS);
+  };
 
   const handleEvent = (parsed: StreamEvent): void => {
     switch (parsed.event) {
@@ -158,6 +187,7 @@ export async function streamChat(
       }
       case 'done': {
         const done = parseData<StreamDone>(parsed.data);
+        finished = true;
         handlers.onDone?.(
           done ?? { status: 'answered', citations: [], cited_clauses: [], relevance_percent: 0 },
         );
@@ -165,6 +195,7 @@ export async function streamChat(
       }
       case 'error': {
         const error = parseData<{ detail: string; code: string }>(parsed.data);
+        finished = true;
         handlers.onError?.(
           error?.detail || 'Не удалось сформировать ответ',
           error?.code || 'stream_error',
@@ -177,26 +208,51 @@ export async function streamChat(
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  watchIdle();
 
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      watchIdle();
 
-    // События разделяются пустой строкой; \r\n встречается за прокси.
-    let boundary = buffer.search(/\r?\n\r?\n/);
-    while (boundary !== -1) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary).replace(/^\r?\n\r?\n/, '');
+      buffer += decoder.decode(value, { stream: true });
 
-      const parsed = parseEventBlock(block);
-      if (parsed) handleEvent(parsed);
+      // События разделяются пустой строкой; \r\n встречается за прокси.
+      let boundary = buffer.search(/\r?\n\r?\n/);
+      while (boundary !== -1) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary).replace(/^\r?\n\r?\n/, '');
 
-      boundary = buffer.search(/\r?\n\r?\n/);
+        const parsed = parseEventBlock(block);
+        if (parsed) handleEvent(parsed);
+
+        boundary = buffer.search(/\r?\n\r?\n/);
+      }
     }
+  } finally {
+    clearTimeout(idleTimer);
   }
 
   // Последнее событие могло прийти без завершающей пустой строки.
   const tail = parseEventBlock(buffer);
   if (tail) handleEvent(tail);
+
+  // Молча закончившийся поток — не успех. Пока это считалось успехом,
+  // сообщение оставалось с признаком «печатается» навсегда: кнопка
+  // отправки разблокировалась, а в пузыре до конца сеанса крутились
+  // три точки, и пользователь ждал ответа, который уже не придёт.
+  if (timedOut) {
+    throw new ApiError(504, {
+      detail: 'Сервис перестал отвечать во время генерации. Повторите запрос.',
+      code: 'stream_idle_timeout',
+    });
+  }
+
+  if (!finished) {
+    throw new ApiError(503, {
+      detail: 'Соединение прервалось до конца ответа. Повторите запрос.',
+      code: 'stream_interrupted',
+    });
+  }
 }

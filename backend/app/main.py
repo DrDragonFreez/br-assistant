@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from typing import Any
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -27,6 +29,11 @@ from app.core.exceptions import register_exception_handlers
 from app.core.logging import RequestContextMiddleware, configure_logging, get_logger
 
 logger = get_logger(__name__)
+
+# Эндпоинты, ответ которых уходит по мере формирования. Сжимать их
+# нельзя: получатель разбирает события по одному, а сжатый поток
+# читается только целиком.
+STREAMING_PATHS = ("/chat/stream",)
 
 
 @asynccontextmanager
@@ -83,6 +90,53 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("application_stopped")
 
 
+class SkipCompressionMiddleware:
+    """Снимает согласование сжатия с потоковых эндпоинтов.
+
+    ``GZipMiddleware`` решает, сжимать ли ответ, по заголовку запроса —
+    ещё до того, как известен тип содержимого. Для потока событий это
+    решение всегда неверное: Starlette сжимает поток кусками, не
+    сбрасывая буфер дефлятора, и получатель не может разобрать событие
+    до накопления данных. Браузер показывает оборвавшийся ответ, хотя
+    сервис продолжает присылать токены.
+
+    Поэтому у таких запросов заголовок ``Accept-Encoding`` убирается
+    до того, как его увидит ``GZipMiddleware``. Отключать сжатие
+    целиком нельзя: на обычных ответах API оно полезно.
+
+    Middleware добавляется ПОСЛЕ ``GZipMiddleware``: Starlette
+    оборачивает приложение снаружи внутрь, и добавленный последним
+    отрабатывает первым.
+    """
+
+    def __init__(self, app: Any, paths: tuple[str, ...]) -> None:
+        """Сохраняет вложенное приложение и список путей.
+
+        Args:
+            app: Вложенное ASGI-приложение.
+            paths: Окончания путей, для которых сжатие не применяется.
+        """
+        self.app = app
+        self.paths = paths
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Пропускает запрос дальше, при необходимости сняв сжатие.
+
+        Args:
+            scope: Область запроса ASGI.
+            receive: Канал получения событий.
+            send: Канал отправки событий.
+        """
+        if scope.get("type") == "http" and scope.get("path", "").endswith(self.paths):
+            scope = dict(scope)
+            scope["headers"] = [
+                (name, value)
+                for name, value in scope["headers"]
+                if name.lower() != b"accept-encoding"
+            ]
+        await self.app(scope, receive, send)
+
+
 def create_app() -> FastAPI:
     """Создаёт и настраивает приложение FastAPI.
 
@@ -117,6 +171,10 @@ def create_app() -> FastAPI:
     # имён slowapi и приложение не поднималось вовсе. Фильтрация на
     # границе контура надёжнее: она не зависит от состояния сервиса.
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    # Добавляется после GZip, поэтому отрабатывает раньше него и успевает
+    # снять согласование сжатия с потока событий.
+    app.add_middleware(SkipCompressionMiddleware, paths=STREAMING_PATHS)
 
     app.add_middleware(
         CORSMiddleware,

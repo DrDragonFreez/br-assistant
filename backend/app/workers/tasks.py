@@ -267,6 +267,12 @@ def validate_document(
             report.recommendations = result.recommendations
             report.checked_rules = result.checked_rules
             report.detected_doc_kind = result.detected_doc_kind
+            # Итог и перечень положений, по которым шла проверка.
+            # Валидатор возвращал их с самого начала, но задача не
+            # записывала, и в отчёте сотрудник видел пустую строку
+            # итога и пустой блок оснований.
+            report.summary = result.summary
+            report.citations = result.citations
 
             return {
                 "report_id": report_id,

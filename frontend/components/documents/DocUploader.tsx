@@ -31,12 +31,24 @@ const ACCEPTED = ['.docx', '.pdf', '.txt', '.md'] as const;
 /** Предел размера совпадает с MAX_UPLOAD_SIZE_MB на бэкенде. */
 const MAX_SIZE_BYTES = 50 * 1024 * 1024;
 
-const POLL_INTERVAL_MS = 1500;
-const POLL_ATTEMPTS = 40;
+// Интервал согласован с лимитом Nginx на /api/v1/documents/
+// (10 запросов в минуту): при 1,5 с опрос упирался в 429 раньше, чем
+// Celery успевал разобрать документ.
+const POLL_INTERVAL_MS = 4000;
+const POLL_ATTEMPTS = 20;
+
+/**
+ * Значение пункта «определить автоматически».
+ *
+ * Пустую строку Radix Select использует как «выбор снят» и бросает
+ * исключение на SelectItem с таким значением, поэтому нужно служебное.
+ * В запрос уходит пустая строка: вид документа определяет бэкенд.
+ */
+const AUTO_KIND = 'auto';
 
 /** Виды документов для подсказки проверяющему. */
 const DOC_KINDS: { value: string; label: string }[] = [
-  { value: '', label: 'Определить автоматически' },
+  { value: AUTO_KIND, label: 'Определить автоматически' },
   { value: 'order', label: 'Приказ' },
   { value: 'direction', label: 'Распоряжение' },
   { value: 'memo', label: 'Служебная записка' },
@@ -47,7 +59,7 @@ const DOC_KINDS: { value: string; label: string }[] = [
 export function DocUploader() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
-  const [docKind, setDocKind] = useState('');
+  const [docKind, setDocKind] = useState(AUTO_KIND);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -83,13 +95,23 @@ export function DocUploader() {
     pickFile(event.dataTransfer.files?.[0] || null);
   };
 
-  /** Опрашивает отчёт до появления вердикта. */
+  /**
+   * Опрашивает отчёт до появления вердикта.
+   *
+   * Ответ 429 означает, что опрос идёт чаще разрешённого лимита, а не
+   * что проверка сорвалась: задача в Celery продолжает работать.
+   * Такой ответ пропускается, следующая попытка идёт позже.
+   */
   const waitForReport = useCallback(async (reportId: string): Promise<void> => {
     for (let attempt = 0; attempt < POLL_ATTEMPTS; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      const current = await documents.validationReport(reportId);
-      setReport(current);
-      if (current.verdict !== 'pending') return;
+      try {
+        const current = await documents.validationReport(reportId);
+        setReport(current);
+        if (current.verdict !== 'pending') return;
+      } catch (caught) {
+        if (!(caught instanceof ApiError) || caught.status !== 429) throw caught;
+      }
     }
     setError('Проверка занимает больше обычного. Отчёт появится в разделе проверок.');
   }, []);
@@ -100,7 +122,10 @@ export function DocUploader() {
     setBusy(true);
     setError('');
     try {
-      const accepted = await documents.validate(file, docKind);
+      const accepted = await documents.validate(
+        file,
+        docKind === AUTO_KIND ? '' : docKind,
+      );
       if (accepted.resource_id) {
         await waitForReport(accepted.resource_id);
       }
@@ -177,7 +202,7 @@ export function DocUploader() {
           </SelectTrigger>
           <SelectContent>
             {DOC_KINDS.map((kind) => (
-              <SelectItem key={kind.value || 'auto'} value={kind.value}>
+              <SelectItem key={kind.value} value={kind.value}>
                 {kind.label}
               </SelectItem>
             ))}

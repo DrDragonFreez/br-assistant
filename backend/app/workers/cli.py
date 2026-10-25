@@ -48,6 +48,9 @@ FILENAME_TO_CODE: dict[str, str] = {
 }
 
 
+KNOWN_DOCUMENT_CODES: frozenset[str] = frozenset(FILENAME_TO_CODE.values())
+
+
 def guess_document_code(filename: str) -> str:
     """Определяет код документа по имени файла.
 
@@ -57,6 +60,14 @@ def guess_document_code(filename: str) -> str:
     Returns:
         Код документа; по умолчанию — код основной инструкции.
     """
+    # Форма загрузки в админке сохраняет файл как «<КОД>_<хеш>.docx» в
+    # тот же каталог. В таком имени нет ни одного русского маркера, и
+    # файл новой редакции рекомендаций опознавался как инструкция:
+    # следующий `make index` делал его действующей Инструкцией по ДОУ.
+    prefix = filename.split("_", 1)[0].upper()
+    if prefix in KNOWN_DOCUMENT_CODES:
+        return prefix
+
     lowered = filename.lower()
     for marker, code in FILENAME_TO_CODE.items():
         if marker in lowered:

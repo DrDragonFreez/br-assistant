@@ -114,6 +114,7 @@ export const SEVERITY_LABELS: Record<string, string> = {
   critical: 'Критично',
   major: 'Существенно',
   minor: 'Замечание',
+  info: 'Заполняется позже',
 };
 
 /** Ограничивает строку по длине, добавляя многоточие. */

@@ -263,7 +263,10 @@ function FieldControl({ field, value, invalid, onChange }: FieldControlProps) {
             <SelectValue placeholder="Выберите значение" />
           </SelectTrigger>
           <SelectContent>
-            {field.options.map((option) => (
+            {/* Пустой вариант Radix Select не принимает: пустая строка
+                означает «выбор снят». Такой вариант в схеме шаблона
+                отбрасывается, иначе отказ затронет весь экран. */}
+            {field.options.filter(Boolean).map((option) => (
               <SelectItem key={option} value={option}>
                 {option}
               </SelectItem>

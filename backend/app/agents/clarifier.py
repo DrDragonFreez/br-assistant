@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -158,6 +159,34 @@ async def generate_clarifying_questions(
     return combined[:3] or [PRESET_QUESTIONS["суть вопроса"]], str(payload.get("reason", ""))
 
 
+# Длиннее этого ответ на вопрос об одном реквизите не бывает: это уже
+# не значение поля, а рассуждение, и записывать его в документ нельзя.
+PLAIN_ANSWER_MAX_LENGTH = 300
+
+# Побуждение изготовить документ. Такая реплика не является ответом на
+# вопрос о значении поля: с неё заполнение начинается.
+REQUEST_PATTERN = re.compile(
+    r"\b(подготов|соста|сформир|созда|сдела|напиш|оформ|заполни|нужен|нужна|нужно|"
+    r"требуется|надо)\w*",
+    re.IGNORECASE,
+)
+
+
+def looks_like_plain_answer(message: str) -> bool:
+    """Проверяет, что реплика — значение поля, а не новая просьба.
+
+    Args:
+        message: Реплика сотрудника.
+
+    Returns:
+        True, если реплику можно записать в ожидаемое поле.
+    """
+    text = message.strip()
+    if not text or len(text) > PLAIN_ANSWER_MAX_LENGTH:
+        return False
+    return not REQUEST_PATTERN.search(text)
+
+
 async def fill_template_slots(
     *,
     template_name: str,
@@ -185,6 +214,17 @@ async def fill_template_slots(
         logger.warning("slot_filling_failed", error=str(exc))
         payload = {}
 
+    # Поле, о котором помощник спрашивал в прошлой реплике: вопрос
+    # всегда задаётся про первое незаполненное обязательное поле.
+    awaited = next(
+        (
+            field["name"]
+            for field in fields
+            if field.get("required") and not filled.get(field["name"])
+        ),
+        "",
+    )
+
     extracted = payload.get("extracted", {})
     updated = dict(filled)
     if isinstance(extracted, dict):
@@ -193,6 +233,34 @@ async def fill_template_slots(
                 continue
             if any(field["name"] == key for field in fields):
                 updated[key] = value
+
+    # Ответ на заданный вопрос принимается детерминированно.
+    #
+    # Полагаться на разбор моделью нельзя, и ошибается она тремя
+    # способами, каждый из которых наблюдался на живом заполнении:
+    # не извлекает ничего — счётчик стоит, и помощник повторяет тот же
+    # вопрос; кладёт ответ в соседнее поле, заполненное шагом раньше,
+    # и перетирает его; выводит из ответа значение поля, о котором не
+    # спрашивала, — из должности ответственного вытащила фамилию и
+    # записала её в подписанты.
+    #
+    # Последнее опаснее всего: реквизит, которого сотрудник не
+    # называл, попадает в документ и выглядит заполненным, так что
+    # проверять его никто не станет.
+    #
+    # Поэтому в цикле «вопрос → ответ» принимается ровно одно поле —
+    # то, о котором спросили. Остальной разбор реплики отбрасывается.
+    # Назвал сотрудник несколько значений сразу — помощник задаст
+    # следующий вопрос: лишний шаг дешевле выдуманного реквизита.
+    if awaited and looks_like_plain_answer(message):
+        if filled:
+            updated = {**filled, awaited: message.strip()}
+            logger.info("slot_filled_from_answer", field=awaited)
+        elif not updated.get(awaited):
+            # Первая реплика: разбирать её на несколько полей можно и
+            # нужно, здесь сотрудник описывает задачу целиком.
+            updated[awaited] = message.strip()
+            logger.info("slot_filled_verbatim", field=awaited)
 
     missing = [
         field["name"]

@@ -24,6 +24,7 @@ from app.api.v1.deps import AccessLevels, SessionDep, require, write_audit
 from app.api.v1.schemas import (
     DocumentGenerateRequest,
     GeneratedDocumentResponse,
+    NextStepResponse,
     TaskAcceptedResponse,
     TemplateResponse,
     ValidationReportResponse,
@@ -40,6 +41,7 @@ from app.core.logging import get_logger
 from app.core.rbac import Permission, Role
 from app.db.models import ChatSession, GeneratedDocument, User, ValidationReport
 from app.rag.loader import load_document
+from app.services.doc_validator import next_steps_for
 from app.services.template_registry import get_template_registry
 from app.workers.tasks import generate_document, validate_document
 
@@ -183,10 +185,13 @@ async def create_document(
             (registry.field_by_name(template, name) or {}).get("label", name)
             for name in missing
         ]
+        # В сообщении — заголовки полей, их читает сотрудник.
+        # В context["fields"] — имена, по ним интерфейс подсвечивает
+        # незаполненные места в форме.
         raise ValidationError(
             "Не заполнены обязательные поля: " + ", ".join(labels),
             code="missing_required_fields",
-            context={"missing": missing},
+            context={"fields": missing},
         )
 
     if payload.session_id is not None:
@@ -466,7 +471,15 @@ async def get_validation_report(
     if report.user_id != user.id and user.role not in {Role.ADMIN, Role.AUDITOR}:
         raise PermissionDeniedError("Отчёт принадлежит другому пользователю")
 
-    return ValidationReportResponse.model_validate(report)
+    # Порядок дальнейших действий не хранится: он целиком определяется
+    # видом документа и вердиктом, и при правке шагов старые отчёты
+    # показывают актуальный порядок.
+    response = ValidationReportResponse.model_validate(report)
+    response.next_steps = [
+        NextStepResponse(**item)
+        for item in next_steps_for(report.detected_doc_kind, report.verdict)
+    ]
+    return response
 
 
 @router.get(

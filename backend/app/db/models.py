@@ -433,6 +433,10 @@ class ValidationReport(Base, UUIDMixin, TimestampMixin):
     )
     checked_rules: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     task_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Положения инструкции, по которым шла проверка: без них замечания
+    # ссылаются на пункты, а основание проверки остаётся непоказанным.
+    citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
 
     __table_args__ = (
         CheckConstraint(

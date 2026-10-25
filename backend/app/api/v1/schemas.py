@@ -11,7 +11,14 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.core.rbac import AccessLevel, Role
 
@@ -103,8 +110,14 @@ class PasswordChangeRequest(BaseModel):
 
 
 # ═══════════════════════════ ДИАЛОГ ═══════════════════════════
-class CitationResponse(BaseModel):
-    """Ссылка на положение инструкции."""
+class CitationResponse(ORMModel):
+    """Ссылка на положение инструкции.
+
+    Читается из двух источников: из графа, где ссылки приходят
+    словарями, и из базы при открытии сохранённого диалога, где это
+    ORM-объекты. Поэтому схема наследует ``ORMModel`` — без этого
+    открытие истории со ссылками возвращало ошибку сервиса.
+    """
 
     chunk_id: str = ""
     document_code: str = ""
@@ -125,6 +138,65 @@ class CitationResponse(BaseModel):
     relevance: float = 0.0
     relevance_percent: int = Field(default=0, description="Релевантность запросу, %")
     rank: int = 0
+
+    @field_validator("chunk_id", mode="before")
+    @classmethod
+    def _chunk_id_to_str(cls, value: Any) -> str:
+        """Приводит идентификатор фрагмента к строке.
+
+        В базе это UUID и он может отсутствовать: фрагмент удаляется
+        вместе с устаревшей редакцией документа, а ссылка на него в
+        истории остаётся.
+
+        Args:
+            value: Значение из источника.
+
+        Returns:
+            Строковый идентификатор либо пустая строка.
+        """
+        return "" if value is None else str(value)
+
+    @model_validator(mode="after")
+    def _fill_derived_fields(self) -> CitationResponse:
+        """Восполняет поля, которых нет в базе.
+
+        В таблице ссылок хранится необходимый минимум. Подпись,
+        хлебные крошки и процент собираются из него, чтобы ссылка в
+        истории выглядела так же, как в только что полученном ответе.
+
+        Returns:
+            Схема с заполненными производными полями.
+        """
+        if not self.clause_numbers and self.clause_number:
+            self.clause_numbers = [self.clause_number]
+
+        if not self.relevance_percent and self.relevance:
+            self.relevance_percent = max(0, min(100, round(self.relevance * 100)))
+
+        address = ", ".join(self.clause_numbers)
+        if not self.breadcrumbs:
+            self.breadcrumbs = " → ".join(
+                item
+                for item in (
+                    f"Приложение {self.annex_number}" if self.annex_number else "",
+                    self.section_title,
+                    f"п. {address}" if address else "",
+                )
+                if item
+            )
+
+        if not self.citation_label:
+            parts = [self.document_title or self.document_code]
+            if self.annex_number:
+                parts.append(f"Приложение {self.annex_number}")
+            if address:
+                parts.append(f"п. {address}")
+            label = ", ".join(item for item in parts if item)
+            if self.page_number:
+                label += f" (с. {self.page_number})"
+            self.citation_label = label
+
+        return self
 
 
 class ClarifyingQuestionResponse(BaseModel):
@@ -284,9 +356,14 @@ class GeneratedDocumentResponse(ORMModel):
 
 
 class ViolationResponse(BaseModel):
-    """Несоответствие требованиям инструкции."""
+    """Отметка по результатам проверки документа.
 
-    severity: Literal["critical", "major", "minor"]
+    Уровень ``info`` — не несоответствие, а реквизит, который
+    заполняется при подписании и регистрации: в оценку он не входит и
+    в порядок доработки не попадает.
+    """
+
+    severity: Literal["critical", "major", "minor", "info"]
     field: str = ""
     problem: str
     requirement: str = ""
@@ -299,6 +376,14 @@ class RecommendationResponse(BaseModel):
 
     priority: int
     severity: str
+    action: str
+    clause: str = ""
+
+
+class NextStepResponse(BaseModel):
+    """Шаг дальнейшего порядка действий после проверки."""
+
+    step: int
     action: str
     clause: str = ""
 
@@ -317,6 +402,7 @@ class ValidationReportResponse(ORMModel):
     created_at: datetime
     summary: str = ""
     citations: list[CitationResponse] = Field(default_factory=list)
+    next_steps: list[NextStepResponse] = Field(default_factory=list)
 
 
 # ═══════════════════════════ БАЗА ЗНАНИЙ ═══════════════════════════

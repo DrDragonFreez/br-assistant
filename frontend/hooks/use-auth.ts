@@ -13,7 +13,7 @@
 
 import { create } from 'zustand';
 
-import { auth } from '@/lib/api';
+import { ApiError, auth } from '@/lib/api';
 import { cacheUser, clearTokens, getCachedUser, getRefreshToken } from '@/lib/auth';
 import type { CurrentUser } from '@/lib/types';
 
@@ -75,7 +75,16 @@ export const useAuth = create<AuthState>((set, get) => ({
       const user = await auth.me();
       cacheUser(user);
       set({ user, loading: false, error: '' });
-    } catch {
+    } catch (caught) {
+      // Сессию закрываем только если сервер отверг токен. Недоступность
+      // сервиса, превышенный лимит запросов и обрыв сети — временные
+      // помехи: показываем сохранённый профиль, а права всё равно
+      // проверяет бэкенд на каждом запросе.
+      const rejected = caught instanceof ApiError && caught.isAuthError;
+      if (!rejected) {
+        set({ user: getCachedUser(), loading: false });
+        return;
+      }
       clearTokens();
       set({ user: null, loading: false });
     }

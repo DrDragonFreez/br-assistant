@@ -35,6 +35,8 @@ next-env.d.ts
 data/instructions/*
 data/templates/*
 data/synthetic_qa/*
+# Файлы, вынесенные из data/instructions: make index берёт оттуда всё подряд.
+data/uploads_archive/
 !data/**/.gitkeep
 artifacts/
 *.gguf
